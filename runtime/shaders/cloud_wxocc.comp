@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* cloud_wxocc.comp - the weather map's occupancy (ACZ_VR_CLOUD_NEAR_SKIP, Quest session 2026-11-08; ps2_clouds.c
+   wxocc_pass, cloud_near.comp flag 8192).
+   The near march sampled every world plane of its ray inside the cloud band, and on the Quest 3 a plane in clear air
+   cost as much as one in a cloud (~0.075 ms a plane for the whole near pass: the weather read's latency in a large
+   shader, not its arithmetic). The density is exactly 0 wherever cl_in_column fails: weather coverage below 0.01, no
+   density, or the band fraction outside the local column [base, top]. So one texel here per 8 x 8 weather texels
+   (64^2 over the 20 km tile: 312 m cells, mapped like the weather map: cl.wx.xy + p.xz cl.wx.z, repeat) holds what any
+   point inside it can read through the weather map's bilinear filter -- its own 8 x 8 texels and the next one each way
+   (10 x 10; a point near the cell's edge blends the neighbour's texel, and a coordinate rounded across the edge lands
+   in a cell that holds that texel too):
+     r = 1 when some texel has coverage >= 0.01 and some texel has density > 0 (a blend of texels all below cannot
+         reach either), else 0: the density is 0 everywhere in the cell;
+     g = the lowest local base, b = the highest local top (at least the highest base + 0.001: cl_density_tx's
+         max(top - base, 1e-3)), both rounded outward to the 8-bit grid with one more step of margin: the band
+         fractions a column can occupy anywhere in the cell.
+   The march (cloud_near.comp) steps over the planes of a ray where its cell says the density is 0, without reads. The
+   pass runs once a frame after the weather pass (4,096 threads, 100 reads each). */
+#include "cloud_common.glsl"
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 28, rgba8) uniform writeonly image2D cl_wxocc_img;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    int R = textureSize(cl_weather_tex, 0).x, N = imageSize(cl_wxocc_img).x, k = R / N;
+    if (c.x >= N || c.y >= N) return;
+    float rmax = 0.0, amax = 0.0, gmin = 1.0, gmax = 0.0, bmax = 0.0;
+    for (int j = -1; j <= k; j++)
+        for (int i = -1; i <= k; i++) {
+            vec4 w = texelFetch(cl_weather_tex, (c * k + ivec2(i, j)) & (R - 1), 0);
+            rmax = max(rmax, w.r); amax = max(amax, w.a);
+            gmin = min(gmin, w.g); gmax = max(gmax, w.g); bmax = max(bmax, w.b);
+        }
+    float occ = rmax >= 0.01 && amax > 0.0 ? 1.0 : 0.0;
+    float lo = max(floor(gmin * 255.0) - 1.0, 0.0) / 255.0;
+    float hi = min(ceil(max(bmax, gmax + 0.001) * 255.0) + 1.0, 255.0) / 255.0;
+    imageStore(cl_wxocc_img, c, vec4(occ, lo, hi, 1.0));
+}

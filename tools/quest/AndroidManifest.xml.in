@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AndroidManifest.xml.in: the Quest 3 manifest template of the aczquest fork (filled by tools/quest/make_apk.sh).
+     Placeholders (each word between two at-signs): PACKAGE (com.kulakovri.ac0oculus for the game,
+     com.kulakovri.aczquest.NAME otherwise), LABEL, VERSION_CODE, VERSION_NAME, LIB_NAME (NativeActivity loads
+     libLIB_NAME.so; always "main" here), DEBUGGABLE (true/false), EXTRA_FEATURES (the graphics API uses-feature line:
+     GLES 3.1 for hello, Vulkan 1.1 for the rest), ACTIVITY (android.app.NativeActivity, or the game's
+     com.kulakovri.aczquest.PadActivity: a NativeActivity subclass that forwards the gamepad, runtime/src/android/java/)
+     and HAS_CODE (false; true with PadActivity's classes.dex).
+     Rules (Meta, 2026-10, QUEST_NATIVE_RESEARCH_2026-11-07 section 2): minSdk 32, targetSdk 34, headtracking required,
+     MAIN + LAUNCHER + com.oculus.intent.category.VR + IMMERSIVE_HMD, supportedDevices, the OpenXR broker <queries>
+     block (copied from the Khronos loader AAR 1.1.65 manifest fragment), hasCode=false (no DEX: NativeActivity),
+     extractNativeLibs=false (libs stored uncompressed and 16 KB aligned in the APK). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@PACKAGE@"
+    android:versionCode="@VERSION_CODE@"
+    android:versionName="@VERSION_NAME@">
+
+  <uses-sdk android:minSdkVersion="32" android:targetSdkVersion="34" />
+
+  <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
+  <!-- no Guardian boundary (seated flight game; the official route instead of debug.oculus.guardian_pause) -->
+  <uses-feature android:name="com.oculus.feature.BOUNDARYLESS_APP" android:required="true" />
+@EXTRA_FEATURES@
+
+  <!-- OpenXR loader AAR 1.1.65 fragment: both permissions (OPENXR is no longer required by Meta, harmless) -->
+  <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+  <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+  <!-- /sdcard/ac0oculus/ (the disc image, commandline.txt, gen_zero/, textures/): on Horizon OS (Android 14, target 34)
+       only "all files access" reads a non-media folder; adb grants it without UI (appops set with the uid
+       option, see tools/quest/headset_test.sh).
+       READ/WRITE_EXTERNAL_STORAGE only matter on API <= 32 (maxSdkVersion), kept for completeness. -->
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+  <!-- the in-app recorder's microphone track (ACZ_QUEST_RECORD, runtime/src/android/ps2_qrec_android.c): a runtime
+       permission, asked for at start through JNI; `adb install -g` or `adb shell pm grant PACKAGE
+       android.permission.RECORD_AUDIO` grants it without the dialog -->
+  <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+  <queries>
+    <!-- to talk to the broker -->
+    <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+    <!-- so client-side code of runtime/layers can talk to their service sides -->
+    <intent>
+      <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+    </intent>
+    <intent>
+      <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+    </intent>
+  </queries>
+
+  <application
+      android:label="@LABEL@"
+      android:allowBackup="false"
+      android:hasCode="@HAS_CODE@"
+      android:extractNativeLibs="false"
+      android:debuggable="@DEBUGGABLE@">
+    <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s" />
+@APP_META@    <!-- the built-in NativeActivity class; singleTask: never two copies; the black fullscreen theme avoids a bad
+         stereoscopic gradient on the app transition (Meta's sample comments) -->
+    <activity
+        android:name="@ACTIVITY@"
+        android:exported="true"
+        android:screenOrientation="landscape"
+        android:launchMode="singleTask"
+        android:excludeFromRecents="true"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+        android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode">
+      <meta-data android:name="android.app.lib_name" android:value="@LIB_NAME@" />
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+        <category android:name="com.oculus.intent.category.VR" />
+        <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

@@ -1,0 +1,50 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* rq_cloud_nearmask.comp (plan 4.2; ps2_clouds_near.c, PS2_RQ_CLOUDS): the near buffer's cells of 8 x 8 texels per eye layer.
+   -DPASS_A, one workgroup per cell: bits 0-1 = 0 no cloud, 1 cloud, 2 cloud and the scene clips the march inside the near range:
+   the eye pass's near composite draws only such cells, by class (rq_clouds_near.vert).
+   -DPASS_B, one thread per cell: bit 8 = march this cell next frame: it or a neighbour holds cloud, or its turn of the slow
+   re-probe (every 8th frame, staggered); the march (rq_cloud_near.comp, flag 16384) clears a cell without the bit at once. */
+#include "cloud_common.glsl"
+layout(push_constant) uniform PC { ivec4 i0; } pc;   /* x cells per row, y rows, z frame */
+layout(set = 1, binding = 2, std430) buffer NearFlags { uint f[]; } fl;
+#if defined(PASS_A)
+layout(local_size_x = 8, local_size_y = 8) in;
+shared uint s_bits;
+void main() {
+    ivec3 g = ivec3(gl_WorkGroupID);
+    ivec2 q = g.xy * 8 + ivec2(gl_LocalInvocationID.xy), lim = ivec2(cl.sizes.y, cl.sizes.z) - 1;
+    if (gl_LocalInvocationIndex == 0u) s_bits = 0u;
+    barrier();
+    if (q.x <= lim.x && q.y <= lim.y) {
+        vec4 c = texelFetch(cl_near_tex, ivec3(q, g.z), 0);
+        vec2 dt = texelFetch(cl_near_depth_tex, ivec3(q, g.z), 0).rg;       /* (clip, and T with ACZ_VR_CLOUD_RQ_NEARFS=2) */
+        if (pc.i0.w != 0) c.a = dt.g;
+        if (c.a < 0.995 || max(c.r, max(c.g, c.b)) > 1.0e-3) {
+            uint b = 1u;
+            if (dt.r < 0.95 * cl.cfg.z) b = 2u;
+            atomicOr(s_bits, b);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        uint i = uint((g.z * pc.i0.y + g.y) * pc.i0.x + g.x);
+        fl.f[i] = (fl.f[i] & 256u) | ((s_bits & 2u) != 0u ? 2u : s_bits & 1u);
+    }
+}
+#elif defined(PASS_B)
+layout(local_size_x = 32) in;
+void main() {
+    int bw = pc.i0.x, bh = pc.i0.y, i = int(gl_GlobalInvocationID.x);
+    if (i >= 2 * bw * bh) return;
+    int eye = i / (bw * bh), y = (i - eye * bw * bh) / bw, x = i - (eye * bh + y) * bw;
+    bool m = false;
+    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+        ivec2 n = clamp(ivec2(x + dx, y + dy), ivec2(0), ivec2(bw - 1, bh - 1));
+        if ((fl.f[(eye * bh + n.y) * bw + n.x] & 3u) != 0u) m = true;
+    }
+    uint h = uint(i) * 2654435761u;
+    if (((uint(pc.i0.z) + (h >> 29)) & 7u) == 0u) m = true;
+    fl.f[i] = (fl.f[i] & 3u) | (m ? 256u : 0u);
+}
+#endif

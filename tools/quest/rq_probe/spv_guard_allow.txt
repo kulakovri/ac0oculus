@@ -1,0 +1,42 @@
+# spv_guard.py's allow list (R-45 guard, outside note 6 item 5, 2026-11-10): fragment stages that trip the rule (a subpass
+# input read, or specialization constants + FragCoord) and the reason each never runs in the foveated eye pass by default.
+# The only production pass with a density map is the eye pass (rq_video.inc rq_eye_make: VkRenderPassFragmentDensityMapCreateInfoEXT);
+# the other one (rq_video.inc rqx_*, PS2_RQ_FEED_FDM / PS2_RQ_SC_DECODE) is a test. An eye-pass pipeline's GS stage is mapped
+# in ps2_video.c's PS2_RQ=eye block (gs_fs -> rq_gs* / gs_rq_mv_ns, gs_lr_fs -> rq_gs_date / gs_rq_mv_lr*), so the PC GS
+# stages below never reach it. Format: name.frag.spv: reason
+cloud_comp.frag.spv: our clouds' composite on the PC / old path (ps2_clouds.c); the eye pass composites with rq_layer_cl / rq_clouds*
+cloud_comp_mv.frag.spv: as cloud_comp.frag.spv
+cloud_stamp.frag.spv: our clouds' stamp pass on the PC / old path (ps2_clouds.c), its own render pass without a density map
+cloud_stamp_mv.frag.spv: as cloud_stamp.frag.spv
+cloud_veil.frag.spv: our clouds' veil pass on the PC / old path (ps2_clouds.c), its own render pass without a density map
+cloud_veil_mv.frag.spv: as cloud_veil.frag.spv
+cockpit.frag.spv: the PC cockpit (cpit_*); the Quest's eye pass draws the cockpit with rq_cockpit* (ACZ_VR_COCKPIT_MATERIAL=quest)
+cockpit_mv.frag.spv: as cockpit.frag.spv
+cockpit_pk.frag.spv: as cockpit.frag.spv
+cockpit_pk_mv.frag.spv: as cockpit.frag.spv
+cockpit_gx.frag.spv: as cockpit.frag.spv (ACZ_VR_GLASS_VARIANTS)
+cockpit_gx_mv.frag.spv: as cockpit.frag.spv (ACZ_VR_GLASS_VARIANTS)
+cockpit_gx_pk.frag.spv: as cockpit.frag.spv (ACZ_VR_GLASS_VARIANTS)
+cockpit_gx_pk_mv.frag.spv: as cockpit.frag.spv (ACZ_VR_GLASS_VARIANTS)
+gs.frag.spv: the PC / old path GS stage; mapped to rq_gs* / gs_rq_mv_ns in eye-pass pipelines
+gs_mv.frag.spv: as gs.frag.spv
+gs_lr.frag.spv: the PC / old path local-read GS stage; mapped to rq_gs_date / gs_rq_mv_lr* in eye-pass pipelines
+gs_mv_lr.frag.spv: as gs_lr.frag.spv
+gs_fg_lr.frag.spv: PS2_FRAME_GRAPH's self-read on the old path's targets (never slot 0 of the eye pass)
+gs_fg_mv_lr.frag.spv: as gs_fg_lr.frag.spv
+gs_zcen.frag.spv: PS2_TERRAIN_ZCENSUS [perf tool] counting variant only
+gs_zcen_mv.frag.spv: PS2_TERRAIN_ZCENSUS [perf tool] only
+gs_zcen_lr.frag.spv: PS2_TERRAIN_ZCENSUS [perf tool] only
+gs_zcen_mv_lr.frag.spv: PS2_TERRAIN_ZCENSUS [perf tool] only
+smooth_warp_mv.frag.spv: the smooth layer's warp, its own render pass without a density map (not active on the Quest)
+rq_cloud_near_fs.frag.spv: the near clouds' full-screen pass, its own render pass without a density map (ps2_clouds_near.c rf_*)
+gs_rq_mv.frag.spv: PS2_RQ_GS_NOSPEC=0 only (default 1 binds gs_rq_mv_ns.frag in the eye pass)
+rq_cockpit_lwet.frag.spv: ACZ_VR_RQ_COCKPIT_WET_VUV=0 only (default 1 loads rq_cockpit_lwet_vuv)
+rq_cockpit_lwet2.frag.spv: ACZ_VR_RQ_COCKPIT_WET_VUV=0 with ACZ_VR_RQ_COCKPIT_WET=lean2 only (default loads the _vuv stages)
+rq_gs_date.frag.spv: KNOWN READ, rare: with the Quest default PS2_RQ_DATE_FREE=1 (since t8) only a DATE draw the full path leaves unresolved reads here: the haze ring whose fold failed at run time (device hunt t8: 0.00-0.01 a list, worst 300-list window 0.05); counted by the `rq date-free:` line; =0 / =2 read the HUD in place (not the Quest default)
+rq_gs_date_mp.frag.spv: as rq_gs_date.frag.spv (PS2_RQ_MP)
+cut_rq_gs_date.frag.spv: as rq_gs_date.frag.spv (its PS2_RQ_CLOUDS_CUT twin, rq13_cut: the same subpass read)
+gs_rq_mv_lr.frag.spv: PS2_RQ_LR_NOSPEC=0 only (default 1 binds gs_rq_mv_lr_ns.frag)
+gs_rq_mv_lr_df0.frag.spv: PS2_RQ_DATE_FORCE [test] only (its soft-particle read keeps the subpass input)
+gs_rq_mv_lr_df1.frag.spv: PS2_RQ_DATE_FORCE [test] only
+gs_rq_mv_lr_ns.frag.spv: as rq_gs_date.frag.spv (the non-lean DATE stage, no specialization constant: the subpass read only)

@@ -1,0 +1,155 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+/* rq_cloud_bake.comp - PS2_RQ_CLOUDS_BAKE (rq7_bake 2026-11-14, prompt 9 steps 2-3; ps2_clouds_far.c bk_record): the far march's
+   samples baked once into small world-anchored volumes, read by rq_cloud_far_march_bake.comp (rq_cloud_far.glsl CL_FAR_BAKE).
+   With the static field (ACZ_VR_CLOUD_STATIC) the density and the light of a place do not change within a mission: they are baked
+   at the mission's first frames (and at a rebase or a band change, whole), and after a content change of the weather map (the list's
+   small opacity steps) re-baked in rolling slices of z rows. The volumes are the weather map's torus (20 km, cloud-frame x / z,
+   REPEAT; texel i covers the weather uv [i / N, (i + 1) / N)), y across the bake's C1 band. Each texel holds the content of its copy
+   nearest the weather window's centre (fp.win), as the splat does. The wind is the cloud frame's drift: a shift of the lookup.
+   One source, a variant per pass:
+     PASS_BAKE_D   the density's coverage term c (R8, sqrt: the thin parts keep their levels): cl_density_tx without the detail
+                   octave and BEFORE its weather density scale wx.a (the march multiplies by the light's a and erodes c by the detail
+                   octave exactly as cl_density_tx does), the base noise prefiltered at the cell; one work group = one coarse cell of
+                   the distance field (4 x 4 x 4 texels), which also writes the cell's occupancy (any texel over the empty threshold)
+     PASS_BAKE_L   the light (RGBA8, a coarser grid): r "above" (the probe's density, cl_above), g the cast shadow's transmittance at
+                   the probe point without the map's edge fade (the march applies it from its eye), b the local height (cl_local_h),
+                   a sqrt(the weather's density scale wx.a)
+     PASS_BAKE_DF  the distance field, separable (L-inf): axis 0 the occupancy -> the distance along x (B), 1 B -> along y (C),
+                   2 C -> along z (the field); capped at R + 1 cells */
+#define CL_RQ_LG
+#define CL_FAR_BAKE_P
+#include "cloud_common.glsl"
+#include "rq_cloud_far.glsl"
+
+layout(set = 1, binding = 15, r8) uniform image3D bk_dens_img;
+layout(set = 1, binding = 16, rgba8) uniform writeonly image3D bk_light_img;
+layout(set = 1, binding = 17, r8) uniform image3D bk_occ_img;
+layout(set = 1, binding = 18, r8) uniform image3D bk_dfx_img;
+layout(set = 1, binding = 19, r8) uniform image3D bk_dfy_img;
+layout(set = 1, binding = 20, r8) uniform image3D bk_df_img;
+
+/* i0: x texels along x / z, y across the band, z the first z row, w the rows; f0: x the cell (m), y the band base, z its top (m of
+   altitude), w the empty threshold (sqrt density); i2 (PASS_BAKE_D): x the first x texel, y the texels along x (a box of the volume,
+   wrapping: PS2_RQ_CLOUDS_BAKE_DIRTY); i1: x / y the distance field's cells along x / z and across the band, z the axis (PASS_BAKE_DF),
+   w the cap R */
+layout(push_constant) uniform BkPC { ivec4 i0; vec4 f0; ivec4 i2; ivec4 i1; } bp;
+
+/* the cloud-space position (relative to this frame's eye) of texel (x, y, z) of an N x NY x N volume: its weather uv, the copy nearest
+   the weather window's centre, the altitude of its place in the band */
+vec3 bk_pos(ivec3 id, int N, int NY) {
+    vec2 uv = (vec2(id.xz) + 0.5) / float(N);
+    vec2 pxz = (uv - cl.wx.xy) / cl.wx.z;
+    if (bp.i2.z != 0) { float P = 1.0 / cl.wx.z; pxz -= P * floor(pxz / P + 0.5); }   /* (PS2_RQ_CLOUDS_ONE=2: the period's torus, the copy nearest the eye) */
+    else pxz -= CL_WEATHER_M * floor((pxz - fp.win.xy) / CL_WEATHER_M + 0.5);
+    float alt = bp.f0.y + (float(id.y) + 0.5) / float(NY) * (bp.f0.z - bp.f0.y);
+    return vec3(pxz.x, alt - cl.origin.y, pxz.y);
+}
+
+/* ---- PS2_RQ_CLOUDS_ONE=2 (rq8_onelayer 2026-11-14, prompt 10 step 3; bp.i2.z 1): the volumes over the cloud list's period (the weather map's
+   torus then, cl.wx its mapping). The base noise must repeat with the period, or the field breaks at the torus's seam half a period from the
+   eye of the bake: the shape's base noise is read with an integer number of its periods over the list's period (round(P / base period):
+   Zero's 21.8 km / 4 km -> 5, a period of 4.37 km, 9 % larger features), from the torus coordinate. The cast shadow is marched here toward the
+   shadow map's light through the weather's envelope (the map's own model, cloud_shadow.comp sh_density, and its strength fp.pred.w), so the
+   light volume needs no map and no window: baked once with the rest. */
+/* (bk_noise_base_p: rq_cloud_far.glsl, the march's near samples read it too) */
+float bk_density_p(vec3 p, vec4 wx, float step_m) {
+    if (!cl_in_column(p, wx)) return 0.0;
+    return cl_density_tx(p, wx, bk_noise_base_p(p, step_m), vec4(0.0), false);
+}
+float bk_sh_density(vec3 q) {                      /* (cloud_shadow.comp sh_density over the whole torus) */
+    vec4 wx = cl_weather(q);
+    float h = cl_height_frac(q);
+    if (h <= 0.0 || h >= 1.0 || wx.r < 0.01 || wx.a <= 0.0) return 0.0;
+    float hl = (h - wx.g) / max(wx.b - wx.g, 1.0e-3);
+    if (hl <= 0.0 || hl >= 1.0) return 0.0;
+    float prof = cl.fogr.z > 0.5 ? smoothstep(0.0, 0.12, hl) * (1.0 - smoothstep(0.75, 1.0, hl)) : cl_profile(hl, cl.band.w);
+    float e = clamp(wx.r * prof, 0.0, 1.0);
+    return 0.5 * e * e * (3.0 - 2.0 * e) * wx.a;
+}
+float bk_cast_p(vec3 q) {                          /* the light's transmittance from q on toward fp.pred.xyz (32 steps to the band's top) */
+    vec3 L = fp.pred.xyz;
+    float k = fp.pred.w, alt = cl_alt(q), top = cl.band.y;
+    if (k <= 0.0 || alt >= top || L.y <= 0.0) return 1.0;
+    float len = (top - alt) / max(L.y, 0.05), ds = len / 32.0, od = 0.0;
+    for (int i = 0; i < 32; i++) od += bk_sh_density(q + L * ((float(i) + 0.5) * ds));
+    return cl_shadow_t(od * cl_extinction() * ds * k);
+}
+
+#if defined(PASS_BAKE_D)
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+shared uint s_occ;
+void main() {
+    int N = bp.i0.x, NY = bp.i0.y;
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    id.x = (id.x + bp.i2.x) % N; id.z = (id.z + bp.i0.z) % N;      /* (the box's texel, wrapping) */
+    if (gl_LocalInvocationIndex == 0u) s_occ = 0u;
+    barrier();
+    bool in_vol = int(gl_GlobalInvocationID.x) < bp.i2.y && id.y < NY && int(gl_GlobalInvocationID.z) < bp.i0.w;
+    if (in_vol) {
+        vec3 p = bk_pos(id, N, NY);
+        vec4 wx = cl_weather(p);
+        float d = bp.i2.z != 0 ? bk_density_p(p, wx, bp.f0.x) : cl_density_ws(p, wx, false, bp.f0.x);
+        float s = wx.a > 0.0 ? sqrt(clamp(d / wx.a, 0.0, 1.0)) : 0.0;   /* (c: cl_density_tx's value before its scale) */
+        imageStore(bk_dens_img, id, vec4(s));
+        if (s >= bp.f0.w) atomicOr(s_occ, 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && in_vol)                 /* (the box's origin and size are multiples of 4: one cell a group) */
+        imageStore(bk_occ_img, ivec3(id.x / 4, gl_WorkGroupID.y, id.z / 4), vec4(s_occ != 0u ? 1.0 : 0.0));
+}
+
+#elif defined(PASS_BAKE_L)
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 4) in;
+void main() {
+    int N = bp.i0.x, NY = bp.i0.y;
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    if (id.x >= N || id.y >= NY || id.z >= bp.i0.w) return;
+    id.z += bp.i0.z;
+    if (id.z >= N) return;
+    vec3 p = bk_pos(id, N, NY);
+    vec3 q = cl_probe_pos(p);
+    float above = cl_above_d(bp.i2.z != 0 ? bk_density_p(q, cl_weather(q), bp.f0.x) : cl_density_ws(q, cl_weather(q), false, bp.f0.x));
+    float traw = 1.0;
+    if (bp.i2.z != 0) traw = bk_cast_p(q);         /* (PS2_RQ_CLOUDS_ONE=2: marched here, no map) */
+    else if (cl.shd[0].w > 0.0) {                       /* (cloud_shadow.glsl cl_shadow_od_map without its edge weight) */
+        float alt = cl.shd[1].w + q.y;
+        vec2 qb = q.xz - cl.shd[1].xy * (alt - cl.shd[1].z);
+        traw = cl_shadow_t(cl_shadow_eval(textureLod(cl_shadow_tex, cl.shd[0].xy + qb * cl.shd[0].z, 0.0), alt, cl.shd[1].z,
+                                          cl.shd[2].x, cl.shd[2].y) * cl.shd[0].w);
+    }
+    vec4 wx = cl_weather(p);
+    float hl = cl_local_h(p, wx);
+    imageStore(bk_light_img, id, vec4(clamp(above, 0.0, 1.0), clamp(traw, 0.0, 1.0), hl, sqrt(clamp(wx.a, 0.0, 1.0))));
+}
+
+#elif defined(PASS_BAKE_DF)
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+void main() {
+    int NC = bp.i1.x, NCY = bp.i1.y, ax = bp.i1.z, R = bp.i1.w;
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    if (id.x >= NC || id.y >= NCY || id.z >= NC) return;
+    float best = float(R + 1);
+    if (ax == 0) {                                 /* the occupancy -> the distance along x (toroidal) */
+        for (int k = -R; k <= R; k++) {
+            ivec3 c = ivec3((id.x + k + NC) % NC, id.y, id.z);
+            if (imageLoad(bk_occ_img, c).r > 0.5) best = min(best, float(abs(k)));
+        }
+        imageStore(bk_dfx_img, id, vec4(best / 255.0));
+    } else if (ax == 1) {                          /* along y (clamped: the band) */
+        for (int k = -R; k <= R; k++) {
+            int y = id.y + k;
+            if (y < 0 || y >= NCY) continue;
+            best = min(best, max(float(abs(k)), floor(imageLoad(bk_dfx_img, ivec3(id.x, y, id.z)).r * 255.0 + 0.5)));
+        }
+        imageStore(bk_dfy_img, id, vec4(best / 255.0));
+    } else {                                       /* along z (toroidal) */
+        for (int k = -R; k <= R; k++) {
+            ivec3 c = ivec3(id.x, id.y, (id.z + k + NC) % NC);
+            best = min(best, max(float(abs(k)), floor(imageLoad(bk_dfy_img, c).r * 255.0 + 0.5)));
+        }
+        imageStore(bk_df_img, id, vec4(best / 255.0));
+    }
+}
+#endif

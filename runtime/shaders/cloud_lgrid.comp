@@ -1,0 +1,44 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* cloud_lgrid.comp - the light grid (ACZ_VR_CLOUD_LGRID, Quest session 2026-11-08; ps2_clouds.c lg_*).
+   The near march's "cloud above" probe (cl_above_probe: one density sample a quarter of the band up, toward the sun)
+   and its cast shadow (cl_cast_t at the probe point: the cloud shadow map) depend only on the world position, not on
+   the ray, the eye or the frame (both fields are smooth: the probe reads no detail noise, the shadow map has 78 m
+   texels). The march evaluated them per sample of every ray in every frame (~0.7 M density reads a frame in M4: 1.8 of
+   the near pass's 4.5 ms on the Quest 3). Here they are cached in a world-anchored 3D grid around the eye -- x and z
+   toroidal by cloud-frame position (period N x cell, REPEAT), y over the C1 band [base, top] -- and refreshed a slice
+   of z rows a frame (all of it every ACZ_VR_CLOUD_LGRID_SLICES frames; everything at a rebase); the march reads one
+   trilinear texel per sample (cloud_common.glsl cl_lgrid). Nubis Cubed (Advances 2023) keeps its light the same way
+   (a summed-density grid amortised over 8 frames). r = above (cl_above), g = the cast shadow's transmittance.
+   ACZ_VR_CLOUD_LGRID_DENS (clouds6 2026-11-11, A.4 piece 5; pc.i1.x = 1, the Quest eye pass): also b = sqrt(the density) at the
+   cell's centre (no detail octave, the noise prefiltered at the cell's size) and a = the local height in its column, for the marches'
+   cached samples (cloud_common.glsl cl_lgd); the level's texels start at y = pc.i1.y (L0 at 0, L1 above it, stacked in one image).
+   pc.i1 = 0 (the PC build, the grid without density): as before. */
+#include "cloud_common.glsl"
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 26, rgba8) uniform writeonly image3D cl_lgrid_img;
+/* i0: x N (texels along x and z), y NY (texels across the band, this level), z the slice's first z row, w its rows
+   i1: x 1 = the density too (ACZ_VR_CLOUD_LGRID_DENS), y the level's first texel in y
+   f0: x cell (m), y / z the eye's cloud-frame x / z modulo N x cell (m) */
+layout(push_constant) uniform PC { ivec4 i0; ivec4 i1; vec4 f0; vec4 f1; } pc;
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    int N = pc.i0.x, NY = pc.i0.y, kz = pc.i0.z + id.z;
+    if (id.x >= N || id.y >= NY || id.z >= pc.i0.w || kz >= N) return;
+    float cell = pc.f0.x, W = cell * float(N);
+    /* the texel's cell centre, modulo W, taken at its copy nearest to the eye (the window around it) */
+    vec2 d = (vec2(float(id.x), float(kz)) + 0.5) * cell - pc.f0.yz;
+    d -= W * round(d / W);
+    float hb = cl.band.x, ht = max(cl.band.y, hb + 1.0);
+    float alt = hb + (float(id.y) + 0.5) / float(NY) * (ht - hb);
+    vec3 p = vec3(d.x, alt - cl.origin.y, d.y);
+    float ab = cl_above_probe(p, pc.i1.x != 0 ? cell : 0.0);
+    float cst = cl_cast_t(cl_probe_pos(p));
+    vec4 o = vec4(clamp(ab, 0.0, 1.0), clamp(cst, 0.0, 1.0), 0.0, 1.0);
+    if (pc.i1.x != 0) {
+        vec4 wx = cl_weather(p);
+        o.b = sqrt(clamp(cl_density_ws(p, wx, false, cell), 0.0, 1.0));
+        o.a = cl_local_h(p, wx);
+    }
+    imageStore(cl_lgrid_img, ivec3(id.x, id.y + pc.i1.y, kz), o);
+}

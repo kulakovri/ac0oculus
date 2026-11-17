@@ -1,0 +1,599 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+/* rq_cloud_far.comp - the far cloud scheduler and march of the Quest eye pass (rq_clouds.inc, ps2_clouds_far.c rq_far_record;
+   the passes -DPASS_TILES / PASS_ARGS / PASS_MARCH). The panorama of cloud_far.comp with parallax at draw time:
+     - the map is drawn with parallax (rq_clouds.frag): every tile keeps the eye position it was marched from (ClTile.cam.xyz,
+       anchor frame) and the composite corrects each lookup with the map's own depth; so a tile no longer goes stale by one
+       eye pixel of parallax but by the distance flown relative to its nearest cloud: the travel rule, sched.x x the nearest
+       cloud (this tile and its neighbours) = the distance at which the correction stops being good enough;
+     - a fixed budget of tiles a frame (sched.z, ACZ_VR_CLOUD_RQ_TILES, default 64): the never-marched ones first (a new
+       generation), then the tiles in view by how far past the travel limit they are (log-2 buckets), then the staggered refresh,
+       then the tiles outside the view; within a bucket a permutation of the tile ids.
+     - tiles that cannot be reached by any ray are written as empty once (a march of a few steps).
+   The tiles in view that hold cloud go into the draw list (binding 7, read by rq_clouds.vert): one instanced quad each.
+   cam.xyz of a tile stays relative to the anchor (ps2_clouds_far.c never re-anchors for this path except at a rebase). */
+#define CL_STORAGE
+#define CL_RQ_LG                 /* (clouds6: the density grid's CloudFrame members, cl_lgd) */
+#include "cloud_common.glsl"
+#include "rq_cloud_far.glsl"
+
+struct ClTile { vec4 cam; uvec4 st; };
+layout(set = 1, binding = 1, std430) buffer ClTiles { ClTile tiles[]; };
+/* cnt[0..7] = the priority buckets (0 never; 1..5 in view over 16 / 8 / 4 / 2 / 1 x the travel limit; 6 in view, the staggered
+   refresh; 7 outside the view); after PASS_ARGS the entries taken this frame; cnt[8] tiles marched, cnt[9] tiles in the draw
+   list, cnt[10] the visible tiles due by travel before the budget (buckets 1-5), cnt[11] (ACZ_DEBUG_CLOUDS) the largest
+   distance flown since a drawn tile's march (m); args = vkCmdDispatchIndirect arguments; dargs = vkCmdDrawIndirect arguments (rq_clouds.vert); list = the 8 buckets.
+   Within a bucket the order is the invocations': a permutation of the tile ids (PASS_TILES), so the tiles a frame's budget
+   takes are scattered over the view and not one row of the map */
+layout(set = 1, binding = 2, std430) buffer ClList { uint cnt[12]; uint args[4]; uint dargs[4]; uint list[]; };
+/* the draw list: uvec2(tile, floatBits(the proxy distance for the composite's early depth test: the nearest cloud of the
+   tile and its neighbours (m), 0 = the near field is active this frame: the quad is at the near plane)) */
+layout(set = 1, binding = 7, std430) buffer RqDraw { uvec2 draw[]; };
+/* PS2_RQ_CLOUDS_FARSWAP (B-1, R-52; fp.rq.x): the visible tiles are re-marched in SWEEPS from one frozen origin each (org, the
+   centre eye when the sweep's first tile was marched) into a staging buffer, never into the displayed map; when every visible
+   tile with cloud (or beside it, or due by age) has been staged once, one copy pass puts the whole sweep into the map at once and
+   gives those tiles the sweep's origin. So every tile in view carries the same origin and the composite's parallax is one vector
+   for the whole map: neighbours can no longer disagree (the far tiles' corners and borders, C1 / C2). The never-marched tiles (a
+   new generation) and the tiles outside the view still go straight into the map. cargs = the copy pass's dispatch (slots).
+   PS2_RQ_CLOUDS_FARFAIR (R-70, fp.rq.w): a sweep ends when its staging is full (RQ_SW_MAX slots) or after fp.rq.y frames, and the
+   candidates come in one fixed order (buckets 1-3, the permutation of PASS_TILES): when more visible tiles qualify than one sweep
+   takes (an overcast deck overhead: ~4,200-4,700 tiles), the same tail of that order -- all of bucket 2 (empty tiles beside cloud)
+   and 3 (due by age), the end of bucket 1 -- missed EVERY sweep and kept the content of a march kilometres back (the drawn tiles'
+   staleness reached 5-12 km of flight): the regular lattice of holes and stale squares. With the switch a tile the last sweep
+   missed (tsw older than the previous sweep) goes first, in bucket 1, then cloud (2), beside cloud (3), due (4): every tile in view
+   is re-marched at least every second sweep, whatever the count. fp.dbg.w = the staging's slots (PS2_RQ_CLOUDS_FARSWAP_SLOTS,
+   0 = 4096): enough slots for a whole sweep (fp.rq.y frames x the budget) keep one origin for every tile in view. */
+#define RQ_SW_MAX (fp.dbg.w > 0.5 ? uint(fp.dbg.w) : 4096u)
+layout(set = 1, binding = 8, std430) buffer RqSweep {
+    vec4 org;        /* xyz the running sweep's origin (anchor frame) */
+    vec4 org_done;   /* the finished sweep's origin (PASS_COPY) */
+    uint sweep;      /* the running sweep's number (tsw[] compares with it) */
+    uint count;      /* tiles staged in the running sweep */
+    uint base;       /* this frame's first staging slot (PASS_ARGS -> PASS_MARCH) */
+    uint start;      /* the frame the running sweep began */
+    uint gen;        /* the map generation the running sweep belongs to (a new one drops it) */
+    uint done;       /* sweeps put into the map */
+    uint last_n;     /* the last finished sweep: tiles */
+    uint last_f;     /* ... and frames */
+    uint cargs[4];   /* vkCmdDispatchIndirect arguments of PASS_COPY (offset 64) */
+    uint tsw[];      /* per tile: the sweep that staged it */
+} S;
+/* per staging slot 65 entries: 64 texels uvec4(half2 L.rg, half2 (L.b, T), half2 (1 / mean, 1 / first), float bits of the depth),
+   then uvec4(tile, float bits of its first cloud, reach, generation) */
+layout(set = 1, binding = 9, std430) buffer RqStage { uvec4 stage[]; };
+
+layout(push_constant) uniform ClFarPC {
+    vec4 cam;     /* xyz the centre eye in the anchor frame (m), w march start (m) */
+    vec4 march;   /* x max distance (m), y min step (m), z step growth */
+    vec4 sched;   /* x the travel limit as a fraction of the tile's nearest cloud (0.05), y the staggered refresh period (frames),
+                     z tile budget per frame, w 1 = the near field is active this frame: every tile in view goes into the
+                     draw list */
+    uvec4 fr;     /* x frame, y the map's used size, z tiles per row, w bit 0 = march every tile, bits 1..8 step cap, bits 9..30
+                     generation, bit 31 = with bit 0: only the tiles in view (PS2_RQ_CLOUDS_FARALL=2) */
+} pc;
+#define FR_GEN ((pc.fr.w >> 9) & 0x3FFFFFu)
+
+#if !defined(PASS_ARGS) && !defined(PASS_COARSE)
+/* one texel into the map, and a used size below the image: repeat the last row / column once, so bilinear sampling at the border
+   of the used region never reads stale texels */
+void put_texel(ivec2 px, vec4 c, float depth, vec4 dp) {
+    imageStore(cl_dir_img, px, c);
+    imageStore(cl_dir_depth_img, px, vec4(depth));
+    imageStore(cl_dir_prof_img, px, dp);
+    int ne = int(pc.fr.y);
+    if (ne < imageSize(cl_dir_img).x && (px.x == ne - 1 || px.y == ne - 1)) {
+        ivec2 q = min(px + ivec2(px.x == ne - 1 ? 1 : 0, px.y == ne - 1 ? 1 : 0), ivec2(ne));
+        imageStore(cl_dir_img, q, c); imageStore(cl_dir_depth_img, q, vec4(depth)); imageStore(cl_dir_prof_img, q, dp);
+        if (px.x == ne - 1 && px.y == ne - 1) {
+            imageStore(cl_dir_img, ivec2(ne, px.y), c); imageStore(cl_dir_depth_img, ivec2(ne, px.y), vec4(depth)); imageStore(cl_dir_prof_img, ivec2(ne, px.y), dp);
+            imageStore(cl_dir_img, ivec2(px.x, ne), c); imageStore(cl_dir_depth_img, ivec2(px.x, ne), vec4(depth)); imageStore(cl_dir_prof_img, ivec2(px.x, ne), dp);
+        }
+    }
+}
+#endif
+
+#if defined(PASS_TILES)
+layout(local_size_x = 64) in;
+uint tile_hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+bool reach_dir(vec3 d) {
+    float hb = cl.band.x, ht = cl.band.y, y0 = cl.origin.y;
+    float t0 = pc.cam.w, t1 = pc.march.x;
+    if (abs(d.y) < 1e-6) return y0 > hb && y0 < ht;
+    float ta = (hb - y0) / d.y, tb = (ht - y0) / d.y;
+    return min(t1, max(ta, tb)) > max(t0, min(ta, tb));
+}
+void main() {
+    uint tpr = pc.fr.z, NT = tpr * tpr, inv = gl_GlobalInvocationID.x;
+    if (inv >= NT) return;
+    uint id = (inv * 5003u) % NT;                                       /* (a permutation: 5003 is prime and no factor of NT) */
+    ivec2 tc = ivec2(id % tpr, id / tpr);
+    float N = float(pc.fr.y);
+    uint gen = FR_GEN;
+    bool force = (pc.fr.w & 1u) != 0u;
+    vec3 dc = cl_uv_dir((vec2(tc) * 8.0 + 4.0) / N);
+    bool reach = reach_dir(dc);
+    float crad = 0.0;
+    for (int k = 0; k < 4; k++) {
+        vec3 d = cl_uv_dir((vec2(tc) + vec2(k & 1, k >> 1)) * 8.0 / N);
+        reach = reach || reach_dir(d);
+        crad = max(crad, acos(clamp(dot(d, dc), -1.0, 1.0)));
+    }
+    /* (PS2_RQ_CLOUDS_FARRESOLVE, fp.dbg.z > 0.5: the shown sweep's origin for the composite's EMPTY tiles, in the draw list's two
+       spare entries draw[NT], draw[NT + 1] (rq_clouds.vert): an empty tile is drawn only to host content the parallax moves into it,
+       and its own origin may be a march kilometres back -- the unreachable tiles are written once per generation --, which threw
+       that content anywhere: shards along the horizon in third person, M10 f12365) */
+    if (inv == 0u && (fp.dbg.z > 0.5 || fp.rq2.w > 0.5)) {           /* (fp.rq2.w: PS2_RQ_CLOUDS_FARWARP_ONE reads it for every tile) */
+        vec3 so = fp.rq.x > 0.5 && S.done > 0u && S.gen == gen ? S.org_done.xyz : pc.cam.xyz;
+        draw[NT] = floatBitsToUint(so.xy); draw[NT + 1u] = uvec2(floatBitsToUint(so.z), 0x5EEDu);
+    }
+    ClTile me = tiles[id];
+    tiles[id].st.z = reach ? 1u : 0u;
+    /* (PS2_RQ_CLOUDS_FARCOARSE: st.y bit 1 = filled from the coarse level, not yet marched: still "never" for the budget) */
+    bool coarse = me.st.w == gen && (me.st.y & 2u) != 0u;
+    bool never = me.st.x == 0xFFFFFFFFu || me.st.w != gen || coarse;
+    bool rchg = (me.st.y & 1u) != (reach ? 1u : 0u);
+    /* visible: inside the union of the parts of both eye images the headset shows, a head-motion margin, the tile's radius */
+    vec4 v0 = cl.vis[0], v1 = cl.vis[1];
+    bool hv = v0.z > v0.x && v1.z > v1.x;
+    float px0 = hv ? min(v0.x, v1.x) : cl.img.x, px1 = hv ? max(v0.z, v1.z) : cl.img.x + cl.img.z;
+    float py0 = hv ? min(v0.y, v1.y) : cl.img.y, py1 = hv ? max(v0.w, v1.w) : cl.img.y + cl.img.w;
+    float m = fp.sch.z + crad;
+    float hx = atan(dot(dc, cl.cam_x.xyz), dot(dc, -cl.cam_z.xyz));            /* angle right of forward */
+    float hy = atan(dot(dc, cl.cam_y.xyz), dot(dc, -cl.cam_z.xyz));            /* angle above forward */
+    bool vis = hx > atan((px0 - cl.proj.z) / cl.proj.x) - m && hx < atan((px1 - cl.proj.z) / cl.proj.x) + m &&
+               hy < atan((cl.proj.w - py0) / cl.proj.y) + m && hy > atan((cl.proj.w - py1) / cl.proj.y) - m;
+    /* PS2_RQ_CLOUDS_FARCOARSE (clouds6 2026-11-11, A.4 P1c, R-80; fp.rq2.y = the coarse level's first entry in the staging): a
+       never-marched tile in view (a new generation's first frames, a head turn into tiles not yet marched) is filled from the coarse
+       level's four corners (PASS_COARSE, bilinear: the colour, the depth data) and drawn until its own march takes it (bucket 0 as
+       before; the march clears the bit). Without it such a tile was not drawn: a hole where the far cloud is */
+    if (fp.rq2.y > 0.5 && !force && vis && reach && never && !coarse) {
+        uint cb = uint(fp.rq2.y);
+        uvec4 hd = stage[cb];
+        if (hd.w == gen) {
+            uint w1 = tpr + 1u, c0 = cb + 1u + uint(tc.y) * w1 + uint(tc.x);
+            uvec4 q[4] = uvec4[4](stage[c0], stage[c0 + 1u], stage[c0 + w1], stage[c0 + w1 + 1u]);
+            vec4 cc[4], pp[4];
+            float fst = CL_DEPTH_NONE;
+            for (int k = 0; k < 4; k++) {
+                cc[k] = vec4(unpackHalf2x16(q[k].x), unpackHalf2x16(q[k].y));
+                vec2 p = unpackHalf2x16(q[k].z);
+                pp[k] = vec4(p, p.x > 0.0 ? 1.0 : 0.0, 0.0);
+                fst = min(fst, uintBitsToFloat(q[k].w));
+            }
+            for (int j = 0; j < 8; j++) for (int i = 0; i < 8; i++) {
+                vec2 f = (vec2(i, j) + 0.5) / 8.0;
+                vec4 wv = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+                vec4 c = wv.x * cc[0] + wv.y * cc[1] + wv.z * cc[2] + wv.w * cc[3];
+                vec4 p = wv.x * pp[0] + wv.y * pp[1] + wv.z * pp[2] + wv.w * pp[3];
+                put_texel(tc * 8 + ivec2(i, j), c, p.z > 1.0e-3 ? p.z / p.x : CL_DEPTH_NONE, p);
+            }
+            me.cam = vec4(uintBitsToFloat(hd.xyz), fst);
+            tiles[id].cam = me.cam;
+            tiles[id].st.x = pc.fr.x; tiles[id].st.y = (reach ? 1u : 0u) | 2u; tiles[id].st.w = gen;
+            coarse = true;
+        }
+    }
+    /* (ACZ_DEBUG_CLOUDS, the list's spare words: +6 the never-marched tiles in view drawn from the coarse level, +7 those not drawn
+       at all -- the holes) */
+    if (fp.dbg.y > 0.5 && vis && reach && never && !force) atomicAdd(list[8u * NT + (coarse ? 6u : 7u)], 1u);
+    /* the nearest cloud of this tile and its neighbours (content can drift in from a neighbour by the parallax) */
+    float dmin = never && !coarse ? 1.0e9 : me.cam.w;
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        if (i == 0 && j == 0) continue;
+        ivec2 nb = clamp(tc + ivec2(i, j), ivec2(0), ivec2(int(tpr) - 1));
+        ClTile t = tiles[uint(nb.y) * tpr + uint(nb.x)];
+        if (t.st.w == gen && t.st.x != 0xFFFFFFFFu) dmin = min(dmin, t.cam.w);
+    }
+    /* the draw list: in view and holding cloud: uvec2(tile, the first guess of the parallax: the nearest cloud of it and its neighbours) */
+    /* (fp.dbg.z, PS2_RQ_CLOUDS_FARNB: also the empty tiles beside a tile with cloud: the parallax moves cloud across a tile border, and
+       an undrawn neighbour cut it there in a straight line) */
+    /* (fp.dbg.z 2, PS2_RQ_CLOUDS_FARRESOLVE=2: every marched tile in view, the unreachable ones too; the per-pixel resolve moves
+       content many tiles when the eye is far from the sweep's origin (third person) and one ring of empty neighbours cut it in steps,
+       as the edge of the reachable tiles did along the horizon -- the map's equator, a staircase of tiles -- with the eye above the
+       band; an empty tile's quad sits at the march start) */
+    /* (clouds7, PS2_RQ_CLOUDS_FARSHOWN, fp.rq3.x: every marched tile in view is a candidate of PASS_RESOLVE -- content the parallax moves
+       from a neighbour lands in it --, listed after the draw list's spare entries, draw[NT + 2 ..]; PASS_RESOLVE writes the draw list
+       itself, the tiles whose resolved texels hold cloud) */
+    if (fp.rq3.x > 0.5 && vis && (!never || coarse)) {
+        uint s = atomicAdd(cnt[9], 1u);
+        draw[NT + 2u + s] = uvec2(id, 0u);
+    } else
+    if (fp.rq3.x < 0.5 && vis && (!never || coarse) && (me.cam.w < 60000.0 || (fp.dbg.z > 0.5 && dmin < 60000.0) || fp.dbg.z > 1.5)) {
+        uint s = atomicAdd(cnt[9], 1u);
+        draw[s] = uvec2(id, floatBitsToUint(dmin < 60000.0 ? max(dmin, pc.cam.w) : pc.cam.w));
+        /* ACZ_DEBUG_CLOUDS (fp.dbg.y): the drawn tiles' staleness: cnt[11] = the largest distance flown since a drawn tile's march (m) */
+        if (fp.dbg.y > 0.5) {
+            atomicMax(cnt[11], uint(length(pc.cam.xyz - me.cam.xyz)));
+            /* (clouds6 2026-11-11, the A.7 gate's structure counts; the list's spare words list[8 NT + 3 ..], cleared and read back by
+               ps2_clouds_far.c with ACZ_DEBUG_CLOUDS) the drawn tile's parallax before any correction -- the eye's offset from its march
+               origin across the ray, over its first cloud -- in far texels (0.2 deg at 1024^2): over 1 (+3) and over 8 (+4); and a drawn
+               tile whose origin differs from a drawn neighbour's by over 1 texel of parallax at its first cloud (+5) */
+            vec3 o = pc.cam.xyz - me.cam.xyz;
+            float tx = length(o - dc * dot(o, dc)) / max(me.cam.w, 1.0) / 0.00346;
+            if (tx > 1.0) atomicAdd(list[8u * NT + 3u], 1u);
+            if (tx > 8.0) atomicAdd(list[8u * NT + 4u], 1u);
+            bool mixed = false;
+            for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+                if ((i == 0 && j == 0) || mixed) continue;
+                ivec2 nb = clamp(tc + ivec2(i, j), ivec2(0), ivec2(int(tpr) - 1));
+                ClTile t = tiles[uint(nb.y) * tpr + uint(nb.x)];
+                if (t.st.w == gen && t.st.x != 0xFFFFFFFFu && t.cam.w < 60000.0 &&
+                    length(t.cam.xyz - me.cam.xyz) / max(me.cam.w, 1.0) > 0.00346) mixed = true;
+            }
+            if (mixed) atomicAdd(list[8u * NT + 5u], 1u);
+        }
+    }
+    if (!force && !reach && !rchg && !never) return;               /* empty and already written as empty */
+    /* ([test] PS2_RQ_CLOUDS_FARALL=2, prompt 9 step 1: the truth in view only -- every tile in view (with the head-motion margin)
+       marched every frame from the eye, the tiles outside the view not at all: the price of one march of every texel in view a
+       frame, without the scheduler; a tile coming into view is marched in that frame) */
+    /* (rq10_artefacts round 2, PS2_RQ_CLOUDS_SUN_T, fp.dbg.x: the tile that holds the sun is marched every frame in view or not -- 64 rays --
+       so the sun's transmittance the glare reads is never a stale tile's; out of view it is not drawn) */
+    bool suntile = false;
+    if (fp.dbg.x > 0.5) {
+        vec3 sd = normalize(cl.sun.xyz);
+        sd /= abs(sd.x) + abs(sd.y) + abs(sd.z);
+        vec2 sp = sd.xz;
+        if (sd.y < 0.0) sp = (1.0 - abs(sp.yx)) * vec2(sp.x >= 0.0 ? 1.0 : -1.0, sp.y >= 0.0 ? 1.0 : -1.0);
+        uvec2 st = min(uvec2((sp * 0.5 + 0.5) * N / 8.0), uvec2(tpr - 1u));
+        suntile = st.y * tpr + st.x == id;
+    }
+    if (force && (pc.fr.w & 0x80000000u) != 0u && !vis && !suntile) return;
+    /* the travel rule: the distance flown since this tile was marched, over the distance its parallax correction holds */
+    bool hasc = dmin < 60000.0;
+    float travel = never ? 1e9 : length(pc.cam.xyz - me.cam.xyz);
+    float ratio = hasc ? travel / (pc.sched.x * max(dmin, pc.cam.w)) : 0.0;
+    /* the refresh for content changes the travel does not see (the list's opacities, colours, the band): by age, so a tile the
+       budget passed over stays due; a tile with no cloud 4 x less often, outside the view 4 x less often */
+    uint period = max(1u, uint(pc.sched.y)) * (hasc ? 1u : 4u) * (vis ? 1u : 4u);
+    bool due = reach && !never && (pc.fr.x - me.st.x) >= period;
+    uint b = 0xFFFFFFFFu;
+    /* PS2_RQ_CLOUDS_COLD (fp.rq.z > 0): a new generation's tiles outside the view wait in the budgeted bucket 7, the ones in view
+       are capped in PASS_ARGS: no burst of a whole map's marches in the first frames */
+    if (force || (never && reach && (vis || fp.rq.z <= 0.0))) b = 0u;
+    else if (never) b = 7u;                                         /* (empty and not reachable: written once, last) */
+    else if (fp.rq.x > 0.5) {
+        /* PS2_RQ_CLOUDS_FARSWAP: a visible tile with cloud (1), beside cloud (2) or due by age / a reach change (3) is staged once per
+           sweep; the travel rule does not apply in view (the sweep's length bounds the staleness); outside the view as before (7) */
+        if (vis) {
+            if (S.tsw[id] != S.sweep && S.gen == gen) {
+                b = me.cam.w < 60000.0 ? 1u : hasc ? 2u : (due || rchg) ? 3u : 0xFFFFFFFFu;
+                /* PS2_RQ_CLOUDS_FARFAIR: missed by the last sweep (staged two or more sweeps ago, or never): first */
+                if (fp.rq.w > 0.5 && b != 0xFFFFFFFFu) {
+                    uint lag = S.sweep - S.tsw[id];
+                    b = lag >= 2u ? 1u : b + 1u;
+                    /* FARFAIR=2: a tile coming into view stale -- in no recent sweep, its march origin more than twice the travel limit
+                       from the shown sweep's (the tiles outside the view get the budget only between sweeps: on a head turn they came in
+                       from kilometres back and stayed until the next copy) -- is marched now straight into the map FROM THE SHOWN
+                       SWEEP'S ORIGIN (bucket 5, first in the budget; PASS_MARCH): it then carries the same origin as its neighbours, so
+                       FARWARP's corners agree (marched from the eye, as first built, the mixed origins made a brick mosaic during M4's
+                       head turns); it joins the next sweep as one the last sweep missed. Before the first sweep is shown: the eye. */
+                    vec3 shown = S.done > 0u ? S.org_done.xyz : pc.cam.xyz;
+                    if (fp.rq.w > 1.5 && lag >= 2u && length(me.cam.xyz - shown) >= 2.0 * pc.sched.x * max(hasc ? dmin : 0.0, pc.cam.w))
+                        b = 5u;
+                }
+            }
+        } else if (ratio >= 1.0 || rchg || due) b = 7u;
+    }
+    else if (vis && ratio >= 16.0) b = 1u;
+    else if (vis && ratio >= 8.0) b = 2u;
+    else if (vis && ratio >= 4.0) b = 3u;
+    else if (vis && ratio >= 2.0) b = 4u;
+    else if (vis && (ratio >= 1.0 || rchg)) b = 5u;
+    else if (vis && due && hasc) b = 6u;
+    else if (ratio >= 1.0 || rchg || due) b = 7u;
+    if (b == 0xFFFFFFFFu) return;
+    uint slot = atomicAdd(cnt[b], 1u);
+    list[b * NT + slot] = id;
+}
+
+#elif defined(PASS_ARGS)
+layout(local_size_x = 1) in;
+void main() {
+    /* the tile budget: bucket 0 (never marched) always; the others in priority order up to the budget */
+    uint budget = uint(pc.sched.z);
+    if (fp.rq.z > 0.5 && (pc.fr.w & 1u) == 0u) cnt[0] = min(cnt[0], uint(fp.rq.z));   /* (PS2_RQ_CLOUDS_COLD: the never-marched tiles in view, capped) */
+    uint n = cnt[0];
+    cnt[10] = cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5];           /* (the visible tiles due by the travel rule before the budget: the backlog) */
+    S.cargs[0] = 0u; S.cargs[1] = 1u; S.cargs[2] = 1u; S.cargs[3] = 0u;
+    if (fp.rq.x > 0.5) {
+        /* PS2_RQ_CLOUDS_FARSWAP: the sweep's bookkeeping (one invocation). cnt[10] = what the running sweep still has to stage */
+        uint gen = FR_GEN;
+        if (S.gen != gen) {                                               /* (a new generation: the staged tiles are void) */
+            S.gen = gen; S.sweep += 1u; S.count = 0u;
+            /* (clouds6, PS2_RQ_CLOUDS_FARONE: and the shown sweep's origin too -- a rebase moved the anchor it is relative to: the
+               never-marched tiles and FARFAIR's bucket 5 from the eye until the new generation's first sweep is put in) */
+            if (fp.rq2.x > 0.5) S.done = 0u;
+        }
+        uint left = budget > n ? budget - n : 0u;
+        /* (FARFAIR=2: the stale tiles coming into view, straight into the map, first in the budget; empty otherwise) */
+        {   uint t = min(cnt[5], left); cnt[5] = t; n += t; left -= t; }
+        /* (bucket 4 is PS2_RQ_CLOUDS_FARFAIR's; without it PASS_TILES leaves it empty in this mode, so the sums are as before) */
+        uint due = cnt[1] + cnt[2] + cnt[3] + cnt[4], age = pc.fr.x - S.start;
+        uint swmax = RQ_SW_MAX;
+        bool fin = S.count > 0u && (due == 0u || age >= uint(fp.rq.y) || S.count + min(due, left) > swmax);
+        if (fin) {
+            /* the sweep is complete (or too old, or the staging is full): PASS_COPY puts it into the map now; the next sweep starts at
+               the next frame's first staged tile (its tiles are due again: their tsw is the old number) */
+            S.cargs[0] = S.count; S.org_done = S.org; S.done += 1u; S.last_n = S.count; S.last_f = age;
+            S.sweep += 1u; S.count = 0u;
+            cnt[1] = 0u; cnt[2] = 0u; cnt[3] = 0u; cnt[4] = 0u;
+        } else {
+            if (S.count == 0u) {
+                /* PS2_RQ_CLOUDS_FARLEAD (fp.pred.w > 0): a sweep is shown from its copy (L frames after its start) until the next copy (2 L):
+                   marched from where the eye will be 1.5 L frames on (the last sweep's L, the eye's smoothed motion), the composite's
+                   parallax offset runs -0.5 L .. +0.5 L of flight instead of L .. 2 L (the corner warp folds where it reaches ~10 % of the
+                   cloud's distance: M2's deck overhead); at most 40 % of the march start */
+                vec3 lead = fp.pred.w > 0.0 ? fp.pred.xyz * (fp.pred.w * float(max(S.last_f, 1u))) : vec3(0.0);
+                float ll = length(lead), lmax = 0.4 * pc.cam.w;
+                if (ll > lmax) lead *= lmax / ll;
+                S.org = vec4(pc.cam.xyz + lead, 1.0); S.start = pc.fr.x;
+            }
+            S.base = S.count;
+            /* (sl: never more slots than the staging holds -- a budget above it, as the every-tile reference runs use, overran it) */
+            uint sl = min(left, swmax - min(S.count, swmax));
+            for (uint b = 1u; b < 5u; b++) { uint t = min(cnt[b], sl); cnt[b] = t; n += t; left -= t; sl -= t; }
+            S.count += cnt[1] + cnt[2] + cnt[3] + cnt[4];
+        }
+        cnt[6] = 0u;
+        {   uint t = min(cnt[7], left); cnt[7] = t; n += t; left -= t; }
+    } else
+    if ((pc.fr.w & 1u) == 0u && budget > 0u) {
+        uint left = budget > n ? budget - n : 0u;
+        /* a part of the budget is kept for the age bucket (sched.y's refresh, bucket 6): the travel buckets cannot starve it; what it
+           does not use goes back to them */
+        uint keep = min(cnt[6], left * 5u / 8u);
+        uint trav = left - keep;
+        for (uint b = 1u; b < 6u; b++) {
+            uint t = min(cnt[b], trav);
+            cnt[b] = t; n += t; trav -= t; left -= t;
+        }
+        {   uint t = min(cnt[6], left); cnt[6] = t; n += t; left -= t; }
+        {   uint t = min(cnt[7], left); cnt[7] = t; n += t; left -= t; }
+    } else
+        for (uint b = 1u; b < 8u; b++) n += cnt[b];
+    cnt[8] = n;
+    args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u;
+    /* the composite's indirect draw: one quad (two triangles) per listed tile, for each view by multiview */
+    dargs[0] = 6u; dargs[1] = cnt[9]; dargs[2] = 0u; dargs[3] = 0u;
+    /* (clouds7, PS2_RQ_CLOUDS_FARSHOWN: PASS_RESOLVE's dispatch in the list's words after its 8 spare ones, list[8 NT + 8 ..]; the draw
+       count is PASS_RESOLVE's, from 0) */
+    if (fp.rq3.x > 0.5) {
+        uint NT = pc.fr.z * pc.fr.z;
+        list[8u * NT + 8u] = cnt[9]; list[8u * NT + 9u] = 1u; list[8u * NT + 10u] = 1u; list[8u * NT + 11u] = 0u;
+        dargs[1] = 0u;
+    }
+}
+
+#elif defined(PASS_RESOLVE)
+/* PS2_RQ_CLOUDS_FARSHOWN (clouds7 2026-11-12, prompt 8 step 3, R-113; fp.rq3.x): the parallax resolved per texel ONCE a frame, at the far
+   map's own angular resolution, into the SHOWN map (bindings 10 / 11: colour + T, and the eye-relative depth data (1 / mean, 1 / first,
+   1)); the eye pass reads it with one bilinear read at the tile's own directions, no moved corner, both eyes alike (beyond 1,300 m the
+   eyes differ by 0.06 pixels). One work group per candidate tile (PASS_TILES: every marched tile in view). For the texel's direction d
+   from the eye E it finds the map's content that lies on that ray: the content at map direction u, distance D(u) from its tile's own
+   march origin O(u) (anchor frame), lies on the ray where |E - O + d s| = D -- a fixed point, solved as rq_clouds.frag's per-pixel
+   resolve did (clouds6) but with each SOURCE tile's own origin (the tiles carry any origins now: no sweeps), up to fp.rq3.y steps until
+   the distance and the origin agree; a texel that does not settle (a disocclusion) fades by the disagreement. With every texel placed by
+   its own distance a tile re-marched from a new origin changes the shown map only by the disocclusion error: nothing swaps, nothing
+   tears. The tiles whose resolved texels hold cloud go into the draw list (draw[0 ..], dargs[1]) with their nearest cloud seen from the
+   eye (the quad's depth). */
+layout(set = 1, binding = 10, rgba16f) uniform writeonly image2D shown_img;
+layout(set = 1, binding = 11, rgba16f) uniform writeonly image2D shown_prof_img;
+layout(local_size_x = 8, local_size_y = 8) in;
+shared uint s_any, s_first;
+/* the map's mean cloud distance about image uv u (the four texels with cloud; from their tiles' origins), 0 = none */
+float rs_dist(vec2 u) {
+    vec4 g = textureGather(cl_dir_prof_tex, u, 0);
+    vec4 ok = vec4(greaterThan(g, vec4(1.0e-6)));
+    float n = ok.x + ok.y + ok.z + ok.w;
+    if (n < 0.5) return 0.0;
+    /* (PS2_RQ_CLOUDS_FARSHOWN_DEPTH=1, fp.rq3.z: the FIRST cloud's distance -- inside a cloud the content starts at the band, and the
+       rays of two origins then meet where it starts, not kilometres on) */
+    if (fp.rq3.z > 0.5) {
+        vec4 gy = textureGather(cl_dir_prof_tex, u, 1);      /* (y = z / first, x = z / mean: the same scale as the mean's) */
+        return n / dot(max(gy, g), ok);
+    }
+    return n / dot(g, ok);
+}
+void main() {
+    uint tpr = pc.fr.z, NT = tpr * tpr, g = gl_WorkGroupID.x;
+    uint tile = draw[NT + 2u + g].x;
+    ivec2 px = ivec2(tile % tpr, tile / tpr) * 8 + ivec2(gl_LocalInvocationID.xy);
+    if (gl_LocalInvocationIndex == 0u) { s_any = 0u; s_first = floatBitsToUint(CL_DEPTH_NONE); }
+    barrier();
+    float N = float(pc.fr.y), Ni = float(textureSize(cl_dir_tex, 0).x), sc = N / Ni;
+    vec3 d = cl_uv_dir((vec2(px) + 0.5) / N);
+    vec2 uv = (vec2(px) + 0.5) / Ni;
+    vec3 E = pc.cam.xyz, O = tiles[tile].cam.xyz;
+    float D = rs_dist(uv);
+    if (D <= 0.0) { float pd = tiles[tile].cam.w; D = pd < 60000.0 ? pd : 0.0; }   /* (no cloud in this direction: the tile's nearest) */
+    vec4 c = vec4(0.0, 0.0, 0.0, 1.0), sp = vec4(0.0);
+    if (D > 0.0) {
+        vec2 u2 = uv;
+        float s = D, w = 1.0;
+        int steps = clamp(int(fp.rq3.y + 0.5), 1, 3);
+        for (int k = 0; k < 3; k++) {
+            if (k >= steps) break;
+            vec3 off = E - O;
+            float b = dot(off, d), cc = dot(off, off) - D * D, disc = b * b - cc;
+            s = disc > 0.0 ? -b + sqrt(disc) : max(-b, 0.0);
+            u2 = cl_dir_uv(normalize(off + d * s)) * sc;
+            float Dn = rs_dist(u2);
+            if (Dn <= 0.0) { D = 0.0; break; }                          /* (no cloud there: clear sky) */
+            ivec2 tt = clamp(ivec2(u2 * Ni) / 8, ivec2(0), ivec2(int(tpr) - 1));
+            vec3 On = tiles[uint(tt.y) * tpr + uint(tt.x)].cam.xyz;
+            float e = abs(Dn - D) / D;
+            /* (PS2_RQ_CLOUDS_FARSHOWN_FADE=0, fp.rq3.w: no fade by the disagreement -- along a tile edge between a near and a far content
+               the fixed point does not settle, and the faded texels showed as thin bright cracks, M10 f2245) */
+            w = fp.rq3.w > 0.5 ? 1.0 : 1.0 - smoothstep(0.05, 0.25, e);
+            bool same = all(equal(On, O));
+            D = Dn; O = On;
+            if (e < 0.02 && same) break;
+        }
+        if (D > 0.0) {
+            c = textureLod(cl_dir_tex, u2, 0.0);
+            c = vec4(c.rgb * w, mix(1.0, c.a, w));
+            vec4 pr = textureLod(cl_dir_prof_tex, u2, 0.0);
+            if (pr.z > 1.0e-3 && pr.x > 1.0e-9) {
+                float mean = pr.z / pr.x, first = min(pr.z / max(pr.y, 1.0e-9), mean);
+                float fe = first * s / max(mean, 1.0);                   /* (the first cloud seen from the eye, scaled as the mean) */
+                /* (R-118, the handover: where the source ray's band end lies from the eye, minus R -- the near march moves its fade-out
+                   by it, so the near and this content weigh every point once; 0 = none) */
+                float R = cl.cfg.z, hd = length(O - E + normalize(E - O + d * s) * R) - R;
+                sp = vec4(1.0 / max(s, 1.0), 1.0 / max(fe, 1.0), 1.0, hd);
+                if (c.a < 0.998) { atomicOr(s_any, 1u); atomicMin(s_first, floatBitsToUint(max(fe, 1.0))); }
+            }
+        }
+    }
+    imageStore(shown_img, px, c);
+    imageStore(shown_prof_img, px, sp);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && s_any != 0u) {
+        uint k = atomicAdd(dargs[1], 1u);
+        draw[k] = uvec2(tile, floatBitsToUint(max(uintBitsToFloat(s_first), 0.5 * pc.cam.w)));
+    }
+}
+
+#elif defined(PASS_MARCH) || defined(PASS_COPY)
+layout(local_size_x = 8, local_size_y = 8) in;
+shared uint s_first;
+#if defined(PASS_MARCH)
+uint tile_at(uint g, uint NT, out uint bk) {
+    uint base = 0u;
+    for (uint b = 0u; b < 8u; b++) {
+        uint c = cnt[b];
+        if (g < base + c) { bk = b; return list[b * NT + g - base]; }
+        base += c;
+    }
+    bk = 0u;
+    return 0u;
+}
+#ifdef CL_FAR_COUNT
+/* [test] PS2_RQ_CLOUDS_FARSTUB (clouds6; the variants rq_cloud_far_march_cnt / _stub only): the work group's samples (coarse,
+   fine: the march's iterations, the probe's extra evaluations not counted), added into list[8 NT ..] (the list's spare words) */
+shared uint s_cc, s_cf;
+#ifdef CL_FAR_BAKE
+shared uint s_cd;   /* (PS2_RQ_CLOUDS_BAKE_COUNT: the distance field's reads, into list[8 NT + 7]: with FARALL's force bit PASS_TILES never counts there) */
+#endif
+#endif
+void main() {
+    uint tpr = pc.fr.z, NT = tpr * tpr, g = gl_WorkGroupID.x, bk;
+    uint tile = tile_at(g, NT, bk);
+    ivec2 px = ivec2(tile % tpr, tile / tpr) * 8 + ivec2(gl_LocalInvocationID.xy);
+    if (gl_LocalInvocationIndex == 0u) s_first = floatBitsToUint(CL_DEPTH_NONE);
+#ifdef CL_FAR_COUNT
+    if (gl_LocalInvocationIndex == 0u) { s_cc = 0u; s_cf = 0u; }
+#ifdef CL_FAR_BAKE
+    if (gl_LocalInvocationIndex == 0u) s_cd = 0u;
+#endif
+#endif
+    barrier();
+    /* PS2_RQ_CLOUDS_FARSWAP: a sweep tile (buckets 1-3; 1-4 with PS2_RQ_CLOUDS_FARFAIR, bucket 4 is empty without it) is marched
+       from the sweep's origin into its staging slot */
+    bool staged = fp.rq.x > 0.5 && bk >= 1u && bk <= 4u;
+    uint slot = staged ? S.base + g - cnt[0] : 0u;
+    /* (PS2_RQ_CLOUDS_FARFAIR=2, bucket 5 in this mode: a stale tile coming into view, marched straight into the map from the shown
+       sweep's origin -- after this frame's copy, if any -- so it agrees with its neighbours; the eye before the first sweep) */
+    /* PS2_RQ_CLOUDS_FARONE (clouds6 2026-11-11, A.4 P1a, R-80; fp.rq2.x): also the never-marched tiles (bucket 0: a head turn brings
+       them into view, 13,758 in M2's first 80 s) and the tiles outside the view (7) are marched from the shown sweep's origin, not the
+       eye, so the tiles in view carry one or two origins instead of one per march (the composite's corners tore between them:
+       R-80's holes); the FARALL reference (the force bit) stays from the eye */
+    bool one = fp.rq2.x > 0.5 && (pc.fr.w & 1u) == 0u && (bk == 0u || bk == 7u);
+    vec3 dorg = fp.rq.x > 0.5 && (bk == 5u || one) && S.done > 0u ? S.org_done.xyz : pc.cam.xyz;
+    vec3 ro = staged ? S.org.xyz - pc.cam.xyz : dorg - pc.cam.xyz;
+    vec3 rd = cl_uv_dir((vec2(px) + 0.5) / float(pc.fr.y));
+    uint cap = (pc.fr.w >> 1) & 0xFFu;
+    ClFarP P = ClFarP(ro, pc.cam.w, pc.march.x, int(cap != 0u ? min(float(cap), cl.cfg.x) : cl.cfg.x) + int(pc.march.w),
+                      pc.march.y, pc.march.z);   /* (rq8_onelayer, PS2_RQ_CLOUDS_ONE: march.w more steps for the march from the eye) */
+#ifdef CL_FAR_CHECK
+    ck_db[0] = ck_db[1] = ck_dp[0] = ck_dp[1] = ck_n[0] = ck_n[1] = ck_ab = ck_su = 0.0;
+#endif
+    ClFarR r = cl_far_march(P, rd, cl_far_jit(vec2(px)));
+#ifdef CL_FAR_CHECK
+    {   /* (the sums x 1000 into the list's 8 spare words: 0 / 1 the baked / procedural density near, 2 / 3 far, 4 / 5 the samples near /
+           far (x 1), 6 |above|, 7 |the cast shadow|) */
+        float v[8] = float[8](ck_db[0] * 1000.0, ck_dp[0] * 1000.0, ck_db[1] * 1000.0, ck_dp[1] * 1000.0, ck_n[0], ck_n[1], ck_ab * 1000.0, ck_su * 1000.0);
+        for (int k = 0; k < 8; k++) if (v[k] > 0.5) atomicAdd(list[8u * NT + uint(k)], uint(v[k] + 0.5));
+    }
+#endif
+    /* the composite's depth data in the profile image (rq_clouds.frag): (1 / mean distance, 1 / first distance, 1), 0 = no cloud;
+       bilinear reads of it let empty texels (0) weaken a distance instead of dragging it to 65 km (the far map's own "none"), and
+       z (1 where there is cloud) is the bilinear weight of the texels with cloud (PS2_RQ_CLOUDS_SOFT normalises by it) */
+    vec4 dp = r.depth < 60000.0 ? vec4(1.0 / r.depth, 1.0 / max(min(r.first, r.depth), 1.0), 1.0, 0.0) : vec4(0.0);
+#ifdef CL_FAR_BAKE
+    if (fp.bk3.w > 0.5 && r.depth < 60000.0) dp.w = clamp(1.0 - r.prof.z, 0.0, 1.0);   /* (PS2_RQ_CLOUDS_ONE: the front part's opacity) */
+#endif
+    if (staged)
+        stage[slot * 65u + gl_LocalInvocationIndex] = uvec4(packHalf2x16(r.L.rg), packHalf2x16(vec2(r.L.b, r.T)), packHalf2x16(dp.xy),
+                                                           floatBitsToUint(r.depth));
+    else put_texel(px, vec4(r.L, r.T), r.depth, dp);
+    atomicMin(s_first, floatBitsToUint(r.first));
+#ifdef CL_FAR_COUNT
+#ifdef CL_FAR_BAKE
+    atomicAdd(s_cc, r.evals & 0x1FFu); atomicAdd(s_cd, (r.evals >> 9) & 0x7Fu); atomicAdd(s_cf, r.evals >> 16);
+#else
+    atomicAdd(s_cc, r.evals & 0xFFFFu); atomicAdd(s_cf, r.evals >> 16);
+#endif
+#endif
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+#ifdef CL_FAR_COUNT
+        atomicAdd(list[8u * NT], s_cc); atomicAdd(list[8u * NT + 1u], s_cf); atomicAdd(list[8u * NT + 2u], 1u);
+#ifdef CL_FAR_BAKE
+        atomicAdd(list[8u * NT + 7u], s_cd);
+#endif
+#endif
+        if (staged) {
+            stage[slot * 65u + 64u] = uvec4(tile, s_first, tiles[tile].st.z & 1u, FR_GEN);
+            S.tsw[tile] = S.sweep;
+        } else {
+            tiles[tile].cam = vec4(dorg, uintBitsToFloat(s_first));
+            tiles[tile].st.x = pc.fr.x;
+            tiles[tile].st.y = tiles[tile].st.z & 1u;
+            tiles[tile].st.w = FR_GEN;
+        }
+    }
+}
+#else
+/* PASS_COPY (PS2_RQ_CLOUDS_FARSWAP): the finished sweep into the map, one work group per staging slot; the tiles take the sweep's
+   origin. A slot of an older generation is dropped (its tile was marched afresh). */
+void main() {
+    uint slot = gl_WorkGroupID.x, tpr = pc.fr.z;
+    uvec4 info = stage[slot * 65u + 64u];
+    uint tile = info.x;
+    if (info.w != FR_GEN || tile >= tpr * tpr) return;
+    ivec2 px = ivec2(tile % tpr, tile / tpr) * 8 + ivec2(gl_LocalInvocationID.xy);
+    uvec4 t = stage[slot * 65u + gl_LocalInvocationIndex];
+    vec2 p = unpackHalf2x16(t.z);
+    put_texel(px, vec4(unpackHalf2x16(t.x), unpackHalf2x16(t.y)), uintBitsToFloat(t.w), vec4(p, p.x > 0.0 ? 1.0 : 0.0, 0.0));
+    if (gl_LocalInvocationIndex == 0u) {
+        tiles[tile].cam = vec4(S.org_done.xyz, uintBitsToFloat(info.y));
+        tiles[tile].st.x = pc.fr.x;
+        tiles[tile].st.y = info.z;
+        tiles[tile].st.w = info.w;
+    }
+}
+#endif
+#elif defined(PASS_COARSE)
+/* PS2_RQ_CLOUDS_FARCOARSE (clouds6 2026-11-11, A.4 P1c, R-80; the variant rq_cloud_far_coarse.comp, with CL_FAR_LG): the coarse
+   whole-sphere level of a new generation, one ray per tile corner ((tpr + 1)^2, 129^2 at 1024^2), all from one origin (sched.xyz,
+   anchor frame: the eye at the generation's first frame), in fp.rq2.z chunks over as many frames (march.w = this chunk's first
+   corner, sched.w = 1 in the last chunk). stage[fp.rq2.y] = the header uvec4(the origin's bits, the generation), written with the
+   last chunk; stage[fp.rq2.y + 1 + corner] = uvec4(half2 L.rg, half2 (L.b, T), half2 (1 / mean, 1 / first) (0 = no cloud), float
+   bits of the first cloud). PASS_TILES fills the never-marched tiles in view from it */
+layout(local_size_x = 64) in;
+void main() {
+    uint tpr = pc.fr.z, w1 = tpr + 1u, k = uint(pc.march.w) + gl_GlobalInvocationID.x, cb = uint(fp.rq2.y);
+    if (k < w1 * w1) {
+        vec3 rd = cl_uv_dir(vec2(k % w1, k / w1) * 8.0 / float(pc.fr.y));
+        uint cap = (pc.fr.w >> 1) & 0xFFu;
+        ClFarP P = ClFarP(pc.sched.xyz - pc.cam.xyz, pc.cam.w, pc.march.x, int(cap != 0u ? min(float(cap), cl.cfg.x) : cl.cfg.x),
+                          pc.march.y, pc.march.z);
+        ClFarR r = cl_far_march(P, rd, 0.5);
+        vec2 dp = r.depth < 60000.0 ? vec2(1.0 / r.depth, 1.0 / max(min(r.first, r.depth), 1.0)) : vec2(0.0);
+        stage[cb + 1u + k] = uvec4(packHalf2x16(r.L.rg), packHalf2x16(vec2(r.L.b, r.T)), packHalf2x16(dp), floatBitsToUint(r.first));
+    }
+    if (gl_GlobalInvocationID.x == 0u && pc.sched.w > 0.5) stage[cb] = uvec4(floatBitsToUint(pc.sched.xyz), FR_GEN);
+}
+#endif

@@ -1,0 +1,15 @@
+ac0oculus
+Copyright 2026 the ac0oculus and ac0vr contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project is derived from ps2recomp: Ace Combat 5 by sal063
+(https://github.com/sal063/Ace-Combat-5-Static-recompilation, Apache-2.0): the recompiler in tools/ps2recomp and tools/vurecomp,
+the runtime in runtime/ and the mod layer. Its files have been modified since 2026-10-18; its README is kept unchanged in
+docs/README_ac5recomp_upstream.md. It shares that runtime with ac0vr (https://github.com/kulakovri/ac0vr), the PC VR version.
+
+Third-party components and their licences: THIRD_PARTY_NOTICES.md.
+
+This project contains no code or data of any PlayStation 2 game and is not affiliated with or endorsed by Bandai Namco
+Entertainment, Sony Interactive Entertainment or Meta. Names of games, consoles and headsets are used only to say what the
+project works with.

@@ -1,0 +1,127 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* rq_cloud_fxfade.comp (PS2_RQ_CLOUDS_FXFADE, R-55 / B-4 of a private script; rq_clouds.inc rqfx_*):
+   the game's effects (smoke, explosions, fire, missile and aircraft trails: GS draws without a depth write) in the Quest eye pass are drawn
+   after our cloud composite and are in no depth buffer, so no cloud ever covered them (M3 45 s: a trail drawn over a cloud). The PC fades
+   them per pixel by our cloud's transmittance in front of their own depth (ACZ_VR_CLOUD_FX_SOFT, cloud_comp.frag -DVEIL + gs.frag fxv).
+   Here the same fade per VERTEX, once a frame, in place in the vertex data the eye pass draws them from: no pipeline of the pass changes,
+   no fragment reads anything (foveation-safe), no attachment is touched.
+   For each effect vertex (its slot-0 target pixel and GS depth): the distance along its ray; the near buffer's transmittance in front of
+   it (both eyes' layers, bilinear over the four texels: T_near^(d / clip), the near volume taken as uniform over the march, as the PC's
+   veil does); the far map's at its direction seen from the tiles' march origin (T_far eased in between the texel's first cloud and
+   2 x mean - first, as PS2_RQ_CLOUDS_SOFT); T = T_near x T_far; the PC's mapping kc = smoothstep over [lo, hi] (ACZ_VR_CLOUD_FX_T
+   +- ACZ_VR_CLOUD_FX_SOFT); the vertex alpha (blends with C = As) or colour (Cs x FIX + Cd) times kc. Mode 2 [test]: the colour shows the
+   fade (red faded, green clear, blue: no cloud in front), as the PC's ACZ_DEBUG_CLOUD_FX_SOFT_TINT.
+   Inputs written by the host after this dispatch was recorded and before the submit (the batch builds its vertices inside the pass): the
+   range table, the HUD batch's vertices and rows. */
+#include "cloud_common.glsl"
+layout(local_size_x = 64) in;
+struct ClTile { vec4 cam; uvec4 st; };
+layout(set = 1, binding = 0, std430) readonly buffer Tl { ClTile tiles[]; };
+layout(set = 1, binding = 1, std430) buffer Gv { float gv[]; };          /* the frame's GS vertices (ps2_vk_vertex) */
+layout(set = 1, binding = 2, std430) buffer Hv { float hv[]; };          /* the HUD batch's vertices (rqh_vtx) */
+layout(set = 1, binding = 3, std430) readonly buffer Hr { float hr[]; }; /* the HUD batch's rows (rqh_row): the fade mode in its spare word */
+layout(set = 1, binding = 4, std430) buffer Tab { uvec4 hdr; uvec4 rng[]; };   /* hdr: x GS ranges, y batch vertices (z, w: the sun's T out, PS2_RQ_CLOUDS_SUN_T); rng: first, count, mode */
+layout(push_constant) uniform PC {
+    vec4 p0;      /* lo, hi (the PC's fade range), mode (1 fade, 2 tint), near on */
+    vec4 p1;      /* near divisor (target px per near texel), near w, near h, T2 (the near T in the depth image's g) */
+    vec4 p2;      /* xyz: the centre eye in the far scheduler's anchor frame; w: the far map's used size N */
+    uvec4 p3;     /* strides in floats: GS vertex, batch vertex, batch row; offsets: row's mode word | batch vertex's row id << 8 */
+    uvec4 p4;     /* x: the GS vertices' first float (vb_off / 4); y: far on; z: PS2_RQ_CLOUDS_SUN_T (the sun's T into hdr.zw) */
+} pc;
+
+vec2 dir_uv(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p * 0.5 + 0.5;
+}
+/* the near volume's transmittance in front of distance d (m along the ray) at target pixel tgt, one eye's layer, bilinear */
+float near_t(vec2 tgt, float d, int eye) {
+    vec2 lp = tgt / pc.p1.x - 0.5;
+    ivec2 b = ivec2(floor(lp)), lim = ivec2(pc.p1.yz) - 1;
+    vec2 f = clamp(lp - vec2(b), 0.0, 1.0);
+    float t[4];
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = clamp(b + ivec2(k & 1, k >> 1), ivec2(0), lim);
+        vec2 nd = texelFetch(cl_near_depth_tex, ivec3(q, eye), 0).rg;
+        float T = pc.p1.w > 0.5 ? nd.g : texelFetch(cl_near_tex, ivec3(q, eye), 0).a;
+        float rn = nd.r;
+        t[k] = (T < 0.9995 && rn > 1.0 && rn < CL_DEPTH_NONE) ? pow(clamp(T, 1.0e-4, 1.0), clamp(d / rn, 0.0, 1.0)) : 1.0;
+    }
+    return mix(mix(t[0], t[1], f.x), mix(t[2], t[3], f.x), f.y);
+}
+/* the far map's transmittance in front of the point P (cloud space, m, relative to the centre eye); x = T in front, y = the map's total */
+vec2 far_t(vec3 P) {
+    float N = pc.p2.w, scale = N / float(textureSize(cl_dir_tex, 0).x);
+    uint tpr = uint(N / 8.0 + 0.5);
+    vec2 u0 = dir_uv(normalize(P));
+    uvec2 tc = min(uvec2(u0 * N / 8.0), uvec2(tpr - 1u));
+    vec3 Po = P + pc.p2.xyz - tiles[tc.y * tpr + tc.x].cam.xyz;     /* (seen from that tile's march origin, as rq_clouds.vert's off) */
+    float dO = length(Po);
+    vec2 uv = dir_uv(Po / max(dO, 1.0e-3)) * scale;
+    float Tf = textureLod(cl_dir_tex, uv, 0.0).a;
+    if (!(Tf < 0.9995)) return vec2(1.0);
+    vec4 pr = textureLod(cl_dir_prof_tex, uv, 0.0);                  /* (w / mean, w / first, w: bilinear, normalised by w) */
+    if (!(pr.z > 1.0e-3 && pr.x > 1.0e-9)) return vec2(1.0, Tf);
+    float mean = pr.z / pr.x, first = min(pr.z / max(pr.y, 1.0e-9), mean);
+    float last = max(2.0 * mean - first, first + 30.0);
+    return vec2(mix(1.0, Tf, smoothstep(first, last, dO)), Tf);
+}
+/* the fade of one vertex at float index o (x, y, z, r, g, b, a at o .. o + 6) of buffer B */
+#define FADE(B, o, mode) {                                                                                      \
+    vec2 tgt = vec2(B[o], B[o + 1u]);                                                                          \
+    float vm = cl_view_depth_m(B[o + 2u]);                                                                     \
+    if (vm < CL_INF) {                                                                                         \
+        vec3 ray = cl_view_ray(tgt);                                                                           \
+        float d = vm * length(ray);                                                                            \
+        float tn = pc.p0.w > 0.5 ? 0.5 * (near_t(tgt, d, 0) + near_t(tgt, d, 1)) : 1.0;                         \
+        vec2 tf = pc.p4.y != 0u ? far_t(normalize(cl_view_to_world(ray)) * d) : vec2(1.0);                     \
+        float T = tn * tf.x;                                                                                   \
+        float kc = clamp((T - pc.p0.x) / max(pc.p0.y - pc.p0.x, 1.0e-3), 0.0, 1.0);                             \
+        kc = kc * kc * (3.0 - 2.0 * kc);                                                                       \
+        if (pc.p0.z > 1.5) {                                                                                   \
+            bool none = tn > 0.9995 && tf.y > 0.9995;                                                          \
+            B[o + 3u] = 128.0 * (1.0 - kc); B[o + 4u] = 128.0 * kc; B[o + 5u] = none ? 128.0 : 0.0;           \
+        } else if (mode == 2u) { B[o + 3u] *= kc; B[o + 4u] *= kc; B[o + 5u] *= kc; }                          \
+        else B[o + 6u] *= kc;                                                                                  \
+    }                                                                                                          \
+}
+/* (rq10_artefacts, PS2_RQ_CLOUDS_SUN_T) the far map's transmittance toward the sun, from this frame's eye: six taps (the centre twice and one
+   texel out on each side), only where the tile there was marched from this frame's eye (PS2_RQ_CLOUDS_ONE: every tile in view, from the
+   eye); else -1 (the host keeps its eased value) */
+float sun_t() {
+    vec3 s = normalize(cl.sun.xyz);
+    float N = pc.p2.w, W = float(textureSize(cl_dir_tex, 0).x), scale = N / W;
+    uint tpr = uint(N / 8.0 + 0.5);
+    vec2 u0 = dir_uv(s);
+    uvec2 tc = min(uvec2(u0 * N / 8.0), uvec2(tpr - 1u));
+    if (length(pc.p2.xyz - tiles[tc.y * tpr + tc.x].cam.xyz) > 30.0) return -1.0;
+    vec2 uv = u0 * scale, px = vec2(1.0 / W);
+    float t = 2.0 * textureLod(cl_dir_tex, uv, 0.0).a;
+    t += textureLod(cl_dir_tex, uv + vec2(px.x, 0.0), 0.0).a + textureLod(cl_dir_tex, uv - vec2(px.x, 0.0), 0.0).a;
+    t += textureLod(cl_dir_tex, uv + vec2(0.0, px.y), 0.0).a + textureLod(cl_dir_tex, uv - vec2(0.0, px.y), 0.0).a;
+    return clamp(t / 6.0, 0.0, 1.0);
+}
+void main() {
+    if (pc.p4.z != 0u && gl_GlobalInvocationID.x == 0u) {
+        float ts = pc.p4.y != 0u && cl.sun.y > -0.2 ? sun_t() : 1.0;
+        hdr.w = floatBitsToUint(max(ts, 0.0)); hdr.z = ts >= 0.0 ? 1u : 2u;
+    }
+    /* the GS draws drawn in place: a workgroup a range, its threads over the range's vertices */
+    for (uint r = gl_WorkGroupID.x; r < hdr.x && r < 4096u; r += gl_NumWorkGroups.x) {
+        uvec4 e = rng[r];
+        for (uint v = gl_LocalInvocationID.x; v < e.y; v += 64u) {
+            uint o = pc.p4.x + (e.x + v) * pc.p3.x;
+            FADE(gv, o, e.z)
+        }
+    }
+    /* the HUD batch's vertices: every one whose row carries a fade mode */
+    uint n = gl_NumWorkGroups.x * 64u;
+    for (uint v = gl_GlobalInvocationID.x; v < hdr.y; v += n) {
+        uint o = v * pc.p3.y;
+        uint row = floatBitsToUint(hv[o + (pc.p3.w >> 8)]);
+        uint mode = uint(hr[row * pc.p3.z + (pc.p3.w & 255u)] + 0.5);
+        if (mode != 0u) FADE(hv, o, mode)
+    }
+}

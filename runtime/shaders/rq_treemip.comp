@@ -1,0 +1,80 @@
+#version 450
+/* rq_treemip.comp (PS2_RQ_TREE_AA bit 16, rq_treemip.inc; rq14_small 2026-11-16, BUGS_RQ R-242): a premultiplied mip chain of a tree
+   impostor, built once a frame after the game has drawn it and before the eye pass reads it. The game's tree cards read a 128 x 128
+   impostor at 4-8 texels an eye pixel with one bilinear tap (no mips: a render target has one level); TREE_AA=11's box read (up to
+   4 x 4 bilinear taps a fragment) filters it right but costs on the device where the cards fill the view (NOTES_RQ 2026-11-16 12:45).
+   Here the filtering moves out of the fragments: the region the cards read (texels 0..w-1 x 0..h-1 of the slot, the draw's CLAMP)
+   is copied premultiplied (rgb x a, a) into level 0 of an image of its own and averaged 2 x 2 down to 1 x 1; the cards then take ONE
+   trilinear tap and divide by its alpha -- the same alpha-weighted colour and mean alpha as the box read's, at any footprint.
+   One workgroup per layer (gl_WorkGroupID.z), 256 invocations: level 1 from four source texels per invocation (writing level 0 on the
+   way), each further level from four texels of the one above it after a barrier. w and h powers of two, 8..512 (rq_treemip.inc). The
+   level images are named with constant indices only (no dynamic indexing of image arrays needed). */
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2DArray src;
+layout(set = 0, binding = 1, rgba8) uniform coherent image2DArray lv[10];
+layout(push_constant) uniform PC { ivec4 a; } pc;   /* x w, y h, z levels (2..10) */
+
+int L;
+uint T;
+
+vec4 avg4(int l, ivec2 q, ivec2 lim) {
+    ivec2 p0 = min(q * 2, lim), p1 = min(q * 2 + ivec2(1, 0), lim), p2 = min(q * 2 + ivec2(0, 1), lim), p3 = min(q * 2 + ivec2(1, 1), lim);
+    vec4 s;
+    switch (l) {
+    case 0: s = imageLoad(lv[0], ivec3(p0, L)) + imageLoad(lv[0], ivec3(p1, L)) + imageLoad(lv[0], ivec3(p2, L)) + imageLoad(lv[0], ivec3(p3, L)); break;
+    case 1: s = imageLoad(lv[1], ivec3(p0, L)) + imageLoad(lv[1], ivec3(p1, L)) + imageLoad(lv[1], ivec3(p2, L)) + imageLoad(lv[1], ivec3(p3, L)); break;
+    case 2: s = imageLoad(lv[2], ivec3(p0, L)) + imageLoad(lv[2], ivec3(p1, L)) + imageLoad(lv[2], ivec3(p2, L)) + imageLoad(lv[2], ivec3(p3, L)); break;
+    case 3: s = imageLoad(lv[3], ivec3(p0, L)) + imageLoad(lv[3], ivec3(p1, L)) + imageLoad(lv[3], ivec3(p2, L)) + imageLoad(lv[3], ivec3(p3, L)); break;
+    case 4: s = imageLoad(lv[4], ivec3(p0, L)) + imageLoad(lv[4], ivec3(p1, L)) + imageLoad(lv[4], ivec3(p2, L)) + imageLoad(lv[4], ivec3(p3, L)); break;
+    case 5: s = imageLoad(lv[5], ivec3(p0, L)) + imageLoad(lv[5], ivec3(p1, L)) + imageLoad(lv[5], ivec3(p2, L)) + imageLoad(lv[5], ivec3(p3, L)); break;
+    case 6: s = imageLoad(lv[6], ivec3(p0, L)) + imageLoad(lv[6], ivec3(p1, L)) + imageLoad(lv[6], ivec3(p2, L)) + imageLoad(lv[6], ivec3(p3, L)); break;
+    case 7: s = imageLoad(lv[7], ivec3(p0, L)) + imageLoad(lv[7], ivec3(p1, L)) + imageLoad(lv[7], ivec3(p2, L)) + imageLoad(lv[7], ivec3(p3, L)); break;
+    default: s = imageLoad(lv[8], ivec3(p0, L)) + imageLoad(lv[8], ivec3(p1, L)) + imageLoad(lv[8], ivec3(p2, L)) + imageLoad(lv[8], ivec3(p3, L)); break;
+    }
+    return s * 0.25;
+}
+
+void store(int l, ivec2 q, vec4 v) {
+    switch (l) {
+    case 1: imageStore(lv[1], ivec3(q, L), v); break;
+    case 2: imageStore(lv[2], ivec3(q, L), v); break;
+    case 3: imageStore(lv[3], ivec3(q, L), v); break;
+    case 4: imageStore(lv[4], ivec3(q, L), v); break;
+    case 5: imageStore(lv[5], ivec3(q, L), v); break;
+    case 6: imageStore(lv[6], ivec3(q, L), v); break;
+    case 7: imageStore(lv[7], ivec3(q, L), v); break;
+    case 8: imageStore(lv[8], ivec3(q, L), v); break;
+    default: imageStore(lv[9], ivec3(q, L), v); break;
+    }
+}
+
+void main() {
+    L = int(gl_WorkGroupID.z);
+    T = gl_LocalInvocationIndex;
+    int w = pc.a.x, h = pc.a.y, n = pc.a.z;
+    ivec2 lim0 = ivec2(w - 1, h - 1);
+    /* level 0 (premultiplied) and level 1 together: four source texels per level-1 texel */
+    int w1 = max(w >> 1, 1), h1 = max(h >> 1, 1);
+    for (uint k = T; k < uint(w1 * h1); k += 256u) {
+        ivec2 q = ivec2(int(k) % w1, int(k) / w1);
+        vec4 s = vec4(0.0);
+        for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+                ivec2 p = min(q * 2 + ivec2(i, j), lim0);
+                vec4 c = texelFetch(src, ivec3(p, L), 0);
+                c.rgb *= c.a;
+                imageStore(lv[0], ivec3(p, L), c);
+                s += c;
+            }
+        imageStore(lv[1], ivec3(q, L), s * 0.25);
+    }
+    for (int l = 2; l < n; l++) {
+        memoryBarrierImage();
+        barrier();
+        int pw = max(w >> (l - 1), 1), ph = max(h >> (l - 1), 1), cw = max(w >> l, 1), ch = max(h >> l, 1);
+        for (uint k = T; k < uint(cw * ch); k += 256u) {
+            ivec2 q = ivec2(int(k) % cw, int(k) / cw);
+            store(l, q, avg4(l - 1, q, ivec2(pw - 1, ph - 1)));
+        }
+    }
+}
