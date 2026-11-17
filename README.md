@@ -43,10 +43,11 @@ builds the Quest app on your PC from your disc.
 Then, in the headset: Library > *Unknown sources* > *ac0oculus*. The first start takes a little longer (the shaders are prepared once).
 
 **Controls.** A gamepad paired with the headset over Bluetooth flies best: its first press makes it the controller in use. The Touch
-controllers work too, as an Xbox pad with the same letters: A is OK, B is back, and the Menu button of the left controller is Start
-and pause. On the title screen (PRESS START BUTTON) A or a trigger starts as well. In flight, closing a hand at the cockpit's stick
-or throttle takes it into your hand; if you would rather keep the controllers a plain pad, set pause menu > ENHANCEMENTS > CONTROLS >
-TOUCH CONTROLLERS to AS A PAD (from the next start). The pause menu's TOUCH CONTROLS card shows what every button does.
+controllers work too, as an Xbox pad with the same letters, and the game's menus show them: A is OK, Y is cancel, and the Menu button
+of the left controller is Start and pause. On the title screen (PRESS START BUTTON) A or a trigger starts as well. In flight, closing
+a hand at the cockpit's stick or throttle takes it into your hand; if you would rather keep the controllers a plain pad, set pause
+menu > ENHANCEMENTS > CONTROLS > TOUCH CONTROLLERS to AS A PAD (from the next start). The pause menu's TOUCH CONTROLS card shows what
+every button does.
 
 **What you need:** a Meta Quest 3 with about 4.5 GB free (plus 1.9 GB for the pack); Windows 10 or 11, 64-bit, with about 5 GB of disk
 for the build; your own US disc of the game; an Xbox or PlayStation pad if you have one. Details for each step are under "The setup".
