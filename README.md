@@ -1,6 +1,6 @@
 # ac0oculus
 
-**Version 0.1.1, an early build.** Tested on one Meta Quest 3, by its author, so far. To play, follow the five steps below; everything
+**Version 0.1.2, an early build.** Tested on one Meta Quest 3, by its author, so far. To play, follow the five steps below; everything
 from Build the APK on is the source route, for working on the code.
 
 A native recompilation of **Ace Combat Zero: The Belkan War** (PlayStation 2, US release, SLUS-21346) that runs **standalone on a
@@ -22,7 +22,7 @@ endorsed by Bandai Namco Entertainment, Sony Interactive Entertainment or Meta. 
 You need your own US disc of the game, a Windows PC for one build and a USB-C cable. Nothing of the game is in these files: the setup
 builds the Quest app on your PC from your disc.
 
-1. **Download the installer.** On the [Releases page](../../releases/latest), take `ac0oculus-0.1.1-setup.exe` (about 18 MB) and put it
+1. **Download the installer.** On the [Releases page](../../releases/latest), take `ac0oculus-0.1.2-setup.exe` (about 18 MB) and put it
    in a new, empty folder.
 2. **Put your disc image next to it.** An ISO image of your own *Ace Combat Zero: The Belkan War* disc, US version (SLUS-21346), in the
    same folder. A DVD drive and a free tool such as ImgBurn make the image from the disc. Other regions do not work.

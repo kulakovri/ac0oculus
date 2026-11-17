@@ -261,6 +261,18 @@ def run(cmd, cwd=None):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
+def why(text):
+    """the tool's own first error line, for the one line the setup's box shows (the rest is in build.log); the home folder as ~"""
+    home = os.path.expanduser('~')
+    for line in text.splitlines():
+        if 'error' in line.lower():
+            s = line.strip()
+            for h in (home, home.replace('\\', '/')):
+                s = s.replace(h, '~')
+            return ': ' + s[:200]
+    return ''
+
+
 def build(app, disc, ndk, key, jobs):
     q = os.path.join(app, 'quest')
     with open(os.path.join(q, 'recipe.json'), encoding='utf-8') as fp:
@@ -313,6 +325,12 @@ def build(app, disc, ndk, key, jobs):
             s = s.replace(k, v)
         return s
 
+    def args(template):
+        # split first, then put the folders in: a folder with a space in its name (a Windows account "First Last", so the default
+        # install folder under its profile) stays inside its one argument. 0.1.0 and 0.1.1 substituted first: -ffile-prefix-map=
+        # with such a folder fell into two arguments and every compile failed ("ERROR 13: compiling ps2_code_0013.c failed")
+        return [sub(a) for a in shlex.split(template)]
+
     base = [clang, '--target=' + rc['target'], '--sysroot=' + sysroot]
     inc = ['-I' + os.path.join(q, 'runtime', 'include'), '-I' + gen, '-I' + os.path.join(q, 'third_party', 'sse2neon')]
 
@@ -322,10 +340,10 @@ def build(app, disc, ndk, key, jobs):
     for o in rc['objects']:
         if o.startswith('@gen:'):
             src = os.path.join(gen, o[5:])
-            jobs_list.append((src, os.path.join(obj, o[5:] + '.o'), shlex.split(sub(rc['defines'])) + inc + shlex.split(sub(rc['flags_gen']))))
+            jobs_list.append((src, os.path.join(obj, o[5:] + '.o'), args(rc['defines']) + inc + args(rc['flags_gen'])))
         elif o == '@vu':
             src = os.path.join(q, 'runtime', 'src', 'ps2_vu.c')
-            jobs_list.append((src, os.path.join(obj, 'ps2_vu.c.o'), shlex.split(sub(rc['defines_vu'])) + inc + shlex.split(sub(rc['flags_vu']))))
+            jobs_list.append((src, os.path.join(obj, 'ps2_vu.c.o'), args(rc['defines_vu']) + inc + args(rc['flags_vu'])))
     # the biggest first: the vector-unit file and the largest generated files set the wall time
     jobs_list.sort(key=lambda j: -os.path.getsize(j[0]) * (4 if j[0].endswith('ps2_vu.c') else 1))
     done = [0]
@@ -341,7 +359,7 @@ def build(app, disc, ndk, key, jobs):
         for src, code, text in ex.map(one, jobs_list):
             if code:
                 say(text[-4000:])
-                raise Fail(13, 'compiling %s failed' % os.path.basename(src))
+                raise Fail(13, 'compiling %s failed%s' % (os.path.basename(src), why(text)))
     say('compile: %d files in %.1f s on %d threads' % (len(jobs_list), time.time() - t0, jobs))
 
     stage('link')
@@ -360,12 +378,12 @@ def build(app, disc, ndk, key, jobs):
     with open(rsp, 'w', encoding='utf-8', newline='\n') as fp:
         fp.write(' '.join('"%s"' % p.replace('\\', '/') for p in items + libs))
     so = os.path.join(b, 'libmain.so')
-    cmd = base + ['-fPIC'] + shlex.split(sub(rc['language_flags'])) + shlex.split(sub(rc['link_flags'])) + \
+    cmd = base + ['-fPIC'] + args(rc['language_flags']) + args(rc['link_flags']) + \
         ['-Wl,-soname,' + rc['soname'], '-o', so, '@' + rsp]
     code, text = run(cmd, cwd=b)
     if code:
         say(text[-4000:])
-        raise Fail(14, 'linking libmain.so failed')
+        raise Fail(14, 'linking libmain.so failed%s' % why(text))
     stripped = os.path.join(b, 'libmain.stripped.so')
     code, text = run([os.path.join(tc, 'bin', 'llvm-strip.exe'), '--strip-unneeded', '-o', stripped, so])
     if code:
@@ -447,6 +465,11 @@ def main(argv):
     ap.add_argument('--ndk-size', type=int, default=NDK_SIZE, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     app = os.path.abspath(a.app)
+    for s in (sys.stdout, sys.stderr):                       # a folder name the output's code page lacks (the output redirected:
+        try:                                                 # cp1252) must not stop the build with a UnicodeEncodeError
+            s.reconfigure(errors='replace')
+        except (AttributeError, ValueError):
+            pass
     if a.log:
         sys.stdout = Tee(sys.stdout, open(a.log, 'w', encoding='utf-8', newline='\n'))
     cfg = load_config(app)
