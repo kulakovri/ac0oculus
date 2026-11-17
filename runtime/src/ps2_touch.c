@@ -59,6 +59,12 @@
 //                  closed the hand holds it (ACZ_TOUCH_GRIP: hold or tap as before); while a trigger holds, the same hand's
 //                  grip does the trigger's job (gun, brake), and a free hand near its control does not fire or brake with
 //                  the trigger: there it grabs. grab_by says which one closed it.
+// ACZ_TOUCH_TITLE_START (default 1; the first public report of the Quest build, 2026-11-17: "stuck on the title screen,
+//                  none of my Quest 3 controller inputs work"): the game's PRESS START BUTTON screen takes Start alone, and
+//                  on Touch Start is the left controller's Menu button, which nothing on that screen says; a player's
+//                  first presses there are A and the trigger. While that screen is up (ps2_touch_set_press_start_fn: the
+//                  game module's word) a press of A, X or either trigger is a Start tap as well; the control itself is
+//                  kept from the game until it is let go, so the main menu behind the title never sees it held. 0 = off.
 // Both modes: the Xbox pad stays live (hybrid); Touch idle sends nothing. Rumble (the game's motors, weather, buffet)
 // goes to Touch at ACZ_TOUCH_HAPTICS (0.5) while Touch is the active controller (ps2_video.c apply_rumble: the device
 // the player used last); stick mode adds detent / AB / gun / missile cues (ACZ_TOUCH_CUES).
@@ -106,6 +112,7 @@ enum { CUE_DETENT = 1, CUE_AB = 2, CUE_GUN = 4, CUE_MISSILE = 8, CUE_CENTRE = 16
 static struct {
     int init, mode, test, toggle, rs_look, thr, frame_cockpit, twist, swap, autopause, remap, dbg;
     int thumb_thrust, card, hints;   /* bug #239: left thumbstick thrust; the card once / always / never; hints */
+    int title_start;                 /* ACZ_TOUCH_TITLE_START: A / X / a trigger is Start on the PRESS START BUTTON screen */
     int autom;                       /* ACZ_TOUCH=auto: PAD mode, muted while a gamepad is the active controller */
     int auto_grab;                   /* ACZ_TOUCH_AUTO_GRAB: 0 off, 1 the GRAB WITH rule, 2 (default) both buttons only at the control */
     int grab;                        /* ACZ_TOUCH_GRAB (PS2_TOUCH_GRAB_*) */
@@ -198,6 +205,7 @@ static void cfg_init(void) {
     cfg.card_hold = clampf_(envf("ACZ_TOUCH_CARD_HOLD", 1.0f), 0.0f, 5.0f);
     if (cfg.card_hold > 0.0f && cfg.card_hold < 0.6f) cfg.card_hold = 0.6f;   /* (past a Start tap's 0.5 s) */
     e = getenv("ACZ_TOUCH_HINTS"); cfg.hints = !(e && *e == '0');
+    e = getenv("ACZ_TOUCH_TITLE_START"); cfg.title_start = !(e && *e == '0');
     cfg.cues = CUE_DETENT | CUE_AB | CUE_GUN | CUE_MISSILE;
     e = getenv("ACZ_TOUCH_CUES");
     if (e) {
@@ -694,6 +702,38 @@ static void map_pad(int focus) {
     if (Rh->upper) vp.btn |= VB(SDL_GAMEPAD_BUTTON_EAST);
     if (L->lower) vp.btn |= VB(SDL_GAMEPAD_BUTTON_WEST);
     if (L->upper) vp.btn |= VB(SDL_GAMEPAD_BUTTON_NORTH);
+}
+
+/* ACZ_TOUCH_TITLE_START: on the game's PRESS START BUTTON screen (the game module says when: ps2_touch_set_press_start_fn)
+   a press of A, X or a trigger is a Start tap, the same 60 ms pulse as the Menu button's. A control fires only from below
+   its release level, so one held while the screen comes up is no press; after a tap the four controls are kept out of the
+   virtual pad until all are let go (the main menu that follows must not read A as held, nor a trigger as a brake). After
+   map_pad, before the Start pulse is applied. */
+static int (*volatile press_start_fn)(void);
+void ps2_touch_set_press_start_fn(int (*fn)(void)) { press_start_fn = fn; }
+static void title_start(int focus) {
+    static const char *const names[4] = { "A", "X", "the right trigger", "the left trigger" };
+    static unsigned char armed[4];
+    static int keep;                                         /* a tap went out: the controls stay with us until released */
+    int (*f)(void) = press_start_fn;
+    if (!cfg.title_start || !f) return;
+    const float v[4] = { R.h[1].lower ? 1.0f : 0.0f, R.h[0].lower ? 1.0f : 0.0f, R.h[1].trigger, R.h[0].trigger };
+    int up = focus && f(), held = 0;
+    for (int k = 0; k < 4; k++) {
+        if (!focus || v[k] <= 0.35f) { armed[k] = 1; continue; }
+        held = 1;
+        if (v[k] < 0.65f || !armed[k]) continue;
+        armed[k] = 0;
+        if (!up) continue;
+        start_until = t_now + 0.06;
+        keep = 1;
+        ps2_log("touch: %s on the PRESS START BUTTON screen: a Start tap (ACZ_TOUCH_TITLE_START)", names[k]);
+    }
+    if (!held) keep = 0;
+    if (keep) {
+        vp.btn &= ~(VB(SDL_GAMEPAD_BUTTON_SOUTH) | VB(SDL_GAMEPAD_BUTTON_WEST));
+        vp.axis[SDL_GAMEPAD_AXIS_LEFT_TRIGGER] = vp.axis[SDL_GAMEPAD_AXIS_RIGHT_TRIGGER] = 0;
+    }
 }
 
 /* game bytes for a normalised -1..1 value past the game's per-axis dead zone (128 +- (64 + 63 |s|); 127 = centre) */
@@ -1346,6 +1386,7 @@ void ps2_touch_update(void) {
     if (stick_map) { map_stick(focus); weapon_cues(); }
     else {
         map_pad(focus);
+        title_start(focus);
         if (start_until > t_now) vp.btn |= VB(SDL_GAMEPAD_BUTTON_START);
         if (back_until > t_now) vp.btn |= VB(SDL_GAMEPAD_BUTTON_BACK);
     }

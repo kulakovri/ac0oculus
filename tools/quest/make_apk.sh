@@ -14,7 +14,7 @@
 #   OUT=<apk>          default build/quest/NAME.apk (in the tree); the work folder is OUT without .apk + .work/
 #   LABEL=<text>       launcher label (default "ac0oculus" for the game, "aczquest NAME" otherwise)
 #   DEBUGGABLE=1|0     android:debuggable (default 1: run-as, dlopen of a pushed .so, ndk-gdb)
-#   VERSION_CODE=1 VERSION_NAME=0.1.0
+#   VERSION_CODE=1 VERSION_NAME=0.1.1
 #   GFX=gles|vulkan|none   the graphics uses-feature line (default gles for hello, vulkan otherwise)
 #   HANDS=1|0          hand tracking declared optional (default 1: no "controller required" launch block)
 #   STRIP=1|0         llvm-strip --strip-unneeded the copies that go into the APK (default 1, as Gradle does; the
@@ -79,7 +79,7 @@ t0=$(now_ms)
 
 # 1. manifest
 python -I "$QTOOLS/apkzip.py" fill "$QTOOLS/AndroidManifest.xml.in" "$work/AndroidManifest.xml" \
-    "PACKAGE=$pkg" "LABEL=$label" "VERSION_CODE=${VERSION_CODE:-1}" "VERSION_NAME=${VERSION_NAME:-0.1.0}" \
+    "PACKAGE=$pkg" "LABEL=$label" "VERSION_CODE=${VERSION_CODE:-1}" "VERSION_NAME=${VERSION_NAME:-0.1.1}" \
     "LIB_NAME=main" "DEBUGGABLE=$dbg" "EXTRA_FEATURES_RAW=$feat" "ACTIVITY=$activity" "HAS_CODE=$hascode" "APP_META_RAW=$appmeta"
 
 # 2. aapt2 link: manifest (+ assets) -> base.apk (no resources, no DEX: hasCode=false)

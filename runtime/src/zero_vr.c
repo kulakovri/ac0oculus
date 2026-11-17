@@ -7682,6 +7682,9 @@ static int zb_title_up(void) {
     if (s == 0x00281C38u) return ps2_kernel_vblank_count() - zb_seq_field >= 90u;
     return s == 0x00281BE8u && zb_seq_ra == 0x002831C8u;
 }
+/* ACZ_TOUCH_TITLE_START (ps2_touch.c): the PRESS START BUTTON screen alone -- "MainSelect" from its first field; not the logos, not
+   the main menu, no movie */
+static int zb_press_start_up(void) { return !zero_in_mission && zb_seq_now == 0x00281C38u; }
 double zero_telem_cpu_us(void) {                          /* ACZ_DEBUG_TELEMETRY: tm_frame's mean since the last call */
     double r = tm_cpu_n ? tm_cpu_ns / 1e3 / tm_cpu_n : 0.0;
     tm_cpu_ns = 0.0; tm_cpu_n = 0;
@@ -7720,6 +7723,9 @@ static void zq_install(void) {
     {   extern void ps2_telem_set_source(int (*fn)(zero_telem *), double (*cpu)(void));
         ps2_telem_set_source(zero_telem_get, zero_telem_cpu_us);
         ps2_stats_set_title_fn(zb_title_up);
+    }
+    {   extern void ps2_touch_set_press_start_fn(int (*fn)(void));   /* (ps2_touch.c, ACZ_TOUCH_TITLE_START) */
+        ps2_touch_set_press_start_fn(zb_press_start_up);
     }
     /* the pause menu's update tells "paused"; the builders' first child allocation must be where it was found */
     static const struct { u32 a, w; } chk[] = {

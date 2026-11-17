@@ -59,6 +59,8 @@ void  ps2_touch_apply(ps2_pad_state *st);                   /* poll_input, after
 void  ps2_touch_rumble(float lo, float hi);                 /* apply_rumble: the merged motor levels 0..1 */
 void  ps2_touch_set_haptics(float v);                       /* ENHANCEMENTS > RUMBLE STRENGTH: ACZ_TOUCH_HAPTICS's level, now */
 void  ps2_touch_stick_remap(ps2_pad_state *st, const float *ls); /* ACZ_PAD_STICK_REMAP (gamepad side item) */
+void  ps2_touch_set_press_start_fn(int (*fn)(void));        /* the game module: 1 while its "press Start" screen is up
+                                                               (ACZ_TOUCH_TITLE_START: A / X / a trigger is Start there) */
 /* the controller registry (ps2_video.c, ctl_priority): Touch as one of the devices */
 int   ps2_touch_present(void);                              /* Touch can give input in this run (on, an XR session or
                                                                the test script) */
