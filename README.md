@@ -1,8 +1,7 @@
 # ac0oculus
 
-**An early build.** It has been played on one Meta Quest 3, by its author. The way to play is a Windows setup that builds the Quest app
-from your own disc on your PC (below, "The setup"; it will be attached to a release on this page); the source route after it is for
-working on the code.
+**Version 0.1.0, an early build.** Played on one Meta Quest 3, by its author, so far. To play, follow the five steps below; everything
+from Build the APK on is the source route, for working on the code.
 
 A native recompilation of **Ace Combat Zero: The Belkan War** (PlayStation 2, US release, SLUS-21346) that runs **standalone on a
 Meta Quest 3**: no PC while you play, no streaming, no emulator. The game's code is translated to C ahead of time on your own PC, from
@@ -17,6 +16,35 @@ platform layer and renderer on top. This tree still builds the PC version too, b
 own disc: the recompiler reads the executable on it, and the game loads everything else from it while you play. The APK you build
 contains code translated from your disc: keep it for yourself, do not share it. This is a free fan project, not affiliated with or
 endorsed by Bandai Namco Entertainment, Sony Interactive Entertainment or Meta. It unlocks nothing and sells nothing.
+
+## Play it in five steps
+
+You need your own US disc of the game, a Windows PC for one build and a USB-C cable. Nothing of the game is in these files: the setup
+builds the Quest app on your PC from your disc.
+
+1. **Download the installer.** On the [Releases page](../../releases/latest), take `ac0oculus-0.1.0-setup.exe` (about 18 MB) and put it
+   in a new, empty folder.
+2. **Put your disc image next to it.** An ISO image of your own *Ace Combat Zero: The Belkan War* disc, US version (SLUS-21346), in the
+   same folder. A DVD drive and a free tool such as ImgBurn make the image from the disc. Other regions do not work.
+3. **Optional: the asset pack.** [Download it here](https://mega.nz/file/OlRTjLJb#0u79tZS7vhGmdsZTuEKONcqgwlGS5ou7aZikHeTmfl0) (a 777 MB
+   zip, 1.9 GB unpacked: 3D cockpits for all 36 aircraft and the gloves, HUD and menu textures), unpack it, and put its folder
+   `ac0oculus-assets` next to the setup. This pack is not made by this project and is not part of it: it is a third-party collection
+   that happens to fit, offered without any warranty or responsibility; use it at your own risk. Without it the game flies from its own
+   views, and you can add the pack later: run the setup again with the folder beside it, then step 5 again.
+4. **Run the setup.** Windows may say "Windows protected your PC" because the setup is not signed yet: click *More info*, then *Run
+   anyway*. Click through the wizard; it finds the disc image by itself. If Google's Android NDK is not on your PC, the wizard shows
+   Google's licence and, once you accept it, downloads the NDK (834 MB). Then it builds the Quest app from your disc in a console
+   window: about a minute and a half.
+5. **Copy it to the Quest.** Once: turn on developer mode (Meta Horizon app on your phone > your headset > Developer Mode; Meta asks
+   for a free developer account). Connect the headset to the PC with a USB-C data cable, put it on and accept *Allow USB debugging*.
+   Then Start menu > *ac0oculus - copy to the Quest*: it installs the app and copies your disc image and the pack (under a minute over
+   USB 3).
+
+Then, in the headset: Library > *Unknown sources* > *ac0oculus*. The first start takes a little longer (the shaders are prepared once).
+A gamepad paired with the headset over Bluetooth flies best; the Touch controllers work too.
+
+**What you need:** a Meta Quest 3 with about 4.5 GB free (plus 1.9 GB for the pack); Windows 10 or 11, 64-bit, with about 5 GB of disk
+for the build; your own US disc of the game; an Xbox or PlayStation pad if you have one. Details for each step are under "The setup".
 
 ## What it does
 
@@ -41,8 +69,8 @@ endorsed by Bandai Namco Entertainment, Sony Interactive Entertainment or Meta. 
 `ac0oculus-0.1.x-setup.exe` (about 18 MB) holds no game: Python, the recompiler, our prebuilt runtime for the headset and two small
 scripts. It needs no Java, Gradle, Android Studio or MSYS2.
 
-1. **Put it in a folder with your disc image**, an ISO of your own US disc. Optional: a folder `ac0oculus-assets` beside it, laid out as
-   the headset's data folder (`cockpits_q4/`, `cockpits_ql_t9/`, `textures/`). Such a pack is not made by this project and is not part of
+1. **Put it in a folder with your disc image**, an ISO of your own US disc. Optional: a folder `ac0oculus-assets` beside it (step 3
+   above), laid out as the headset's data folder (`cockpits_q4/`, `cockpits_ql_t9/`, `textures/`). Such a pack is not made by this project and is not part of
    it; without it the game flies from its own views.
 2. **Run it.** Windows may say "Windows protected your PC" (the setup is not signed): *More info*, *Run anyway*. The wizard installs for
    your user only (`%LOCALAPPDATA%\Programs\ac0oculus`, no administrator), finds the disc beside it and checks it (only SLUS-21346
@@ -158,7 +186,7 @@ The cockpit models are not in this repository: each file holds a model's meshes 
 from `/sdcard/ac0oculus/cockpits_q4/` (BC7 / BC1 textures with their mips, about 1.8 GB for 36 aircraft and the gloves), made from a set
 of PC cockpit files by `tools/quest/make_cockpits_q4.sh` (its packer, `tools/cockpit/cpit_pack.cpp`, builds with
 `tools/cockpit/build_cpit_pack.sh`). The PC set's models of the FlightGear community (GPL) are built by the scripts in
-`tools/cockpit/`; a public set is not published yet. Mesh LOD side files, if a set brings them, go to `/sdcard/ac0oculus/cockpits_ql_t9/`.
+`tools/cockpit/`; a public set is not published yet. The optional pack of step 3 above brings a full set laid out this way. Mesh LOD side files, if a set brings them, go to `/sdcard/ac0oculus/cockpits_ql_t9/`.
 
 Without a cockpit set you fly from the game's own views, which is the original game.
 
