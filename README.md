@@ -1,6 +1,6 @@
 # ac0oculus
 
-**Version 0.1.2, an early build.** Tested on one Meta Quest 3, by its author, so far. To play, follow the five steps below; everything
+**Version 0.1.3, an early build.** Tested on one Meta Quest 3, by its author, so far. To play, follow the five steps below; everything
 from Build the APK on is the source route, for working on the code.
 
 A native recompilation of **Ace Combat Zero: The Belkan War** (PlayStation 2, US release, SLUS-21346) that runs **standalone on a
@@ -22,7 +22,7 @@ endorsed by Bandai Namco Entertainment, Sony Interactive Entertainment or Meta. 
 You need your own US disc of the game, a Windows PC for one build and a USB-C cable. Nothing of the game is in these files: the setup
 builds the Quest app on your PC from your disc.
 
-1. **Download the installer.** On the [Releases page](../../releases/latest), take `ac0oculus-0.1.2-setup.exe` (about 18 MB) and put it
+1. **Download the installer.** On the [Releases page](../../releases/latest), take `ac0oculus-0.1.3-setup.exe` (about 18 MB) and put it
    in a new, empty folder.
 2. **Put your disc image next to it.** An ISO image of your own *Ace Combat Zero: The Belkan War* disc, US version (SLUS-21346), in the
    same folder. A DVD drive and a free tool such as ImgBurn make the image from the disc. Other regions do not work.
@@ -44,10 +44,10 @@ Then, in the headset: Library > *Unknown sources* > *ac0oculus*. The first start
 
 **Controls.** A gamepad paired with the headset over Bluetooth flies best: its first press makes it the controller in use. The Touch
 controllers work too, as an Xbox pad with the same letters, and the game's menus show them: A is OK, Y is cancel, and the Menu button
-of the left controller is Start and pause. On the title screen (PRESS START BUTTON) A or a trigger starts as well. In flight, closing
-a hand at the cockpit's stick or throttle takes it into your hand; if you would rather keep the controllers a plain pad, set pause
-menu > ENHANCEMENTS > CONTROLS > TOUCH CONTROLLERS to AS A PAD (from the next start). The pause menu's TOUCH CONTROLS card shows what
-every button does.
+of the left controller is Start and pause. On the title screen (PRESS START BUTTON) A or a trigger starts as well. In flight they are
+a gamepad too: the left thumbstick flies, the right trigger speeds up, the left one slows down, the grips yaw; the pause menu's TOUCH
+CONTROLS card shows what every button does. Taking the cockpit's stick and throttle into your hands (HANDS ON STICK) is an
+experimental mode you choose yourself: pause menu > ENHANCEMENTS > CONTROLS > TOUCH CONTROLLERS, from the next start.
 
 **What you need:** a Meta Quest 3 with about 4.5 GB free (plus 1.9 GB for the pack); Windows 10 or 11, 64-bit, with about 5 GB of disk
 for the build; your own US disc of the game; an Xbox or PlayStation pad if you have one. Details for each step are under "The setup".

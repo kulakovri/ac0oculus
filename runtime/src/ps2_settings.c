@@ -21,8 +21,11 @@
 #if defined(PS2_QUEST) || defined(PS2_QUEST_SETTINGS)
 #define ENH_QUEST 1
 static int enh_quest_pkey;                  /* the Quest: the file had a quality_preset line (ignored: one tuned frame) */
+/* (TOUCH CONTROLLERS' help: on the Quest AUTO never takes the stick by itself, ACZ_TOUCH_AUTO_GRAB=0 there, BUGS_RQ R-312) */
+#define ENH_TOUCH_HELP "Quest controllers as a pad, or as hands on stick and throttle (experimental); AUTO: a pad, silent beside a gamepad."
 #else
 #define ENH_QUEST 0
+#define ENH_TOUCH_HELP "Quest controllers as a pad or as hands on stick and throttle; AUTO: a pad until a hand takes the stick."
 #endif
 
 ps2_settings ps2_cfg;
@@ -843,7 +846,7 @@ static enh_row enh_rows[] = {                /* (not const: ACTIVE CONTROLLER's 
         { "" }, { "PRESS A" }, { 0 } }, 0, L_NONE },
     /* (shown only once a Touch controller has been seen, or with ACZ_TOUCH set: ps2_enh_touch_rows) */
     EI("touch_controllers", "ACZ_TOUCH", CONTROLS, RESTART, 4, 0, 0, "TOUCH CONTROLLERS",
-       "Quest controllers as a pad or as hands on stick and throttle; AUTO: a pad until a hand takes the stick.",
+       ENH_TOUCH_HELP,
        V("", "pad", "stick", "off"), V("AUTO", "AS A PAD", "HANDS ON STICK", "OFF"), L_TOUCH),
     EI("touch_grab", "ACZ_TOUCH_GRAB", CONTROLS, MISSION, 3, 2, 2, "GRAB WITH",
        "The button that closes your hand; EITHER: grip anywhere (AUTO: at the lever), trigger at the lever.",

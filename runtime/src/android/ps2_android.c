@@ -674,6 +674,12 @@ static void defaults(void) {
        without this a paired pad did nothing. A HOTAS stays opt-in (ACZ_QUEST_JOY=1): the Touch controllers' own Android
        input device lists as a joystick and must not become one. */
     setenv("ACZ_QUEST_PAD", "1", 0);
+    /* Touch flies as a gamepad unless the player chooses HANDS ON STICK (BUGS_RQ R-312, 2026-11-18): with the PC's default a
+       hand closing at the stick or the lever took it and the session turned HANDS ON STICK by itself -- the two players of the
+       public thread who flew with Touch: "wonky with grabbing the stick", "impossible to fly with the quest controllers"; the
+       owner: "clearly a work-in-progress mode, weakly playable for me too". AUTO here = a pad while no gamepad flies, silent
+       beside one, and it never takes the controls; ENHANCEMENTS > CONTROLS > TOUCH CONTROLLERS: HANDS ON STICK is the way in. */
+    setenv("ACZ_TOUCH_AUTO_GRAB", "0", 0);
     ps2_enh_boot();
 }
 
